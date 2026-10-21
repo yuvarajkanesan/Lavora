@@ -1,0 +1,49 @@
+# Platform-independent tests on every push / PR (Windows + Linux); a tag like v0.1.0 also builds the installer.
+# NOTE: written without being able to run it here; check the first run and adjust versions if needed.
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff check .
+      - run: python -m mypy lavora
+      - name: Tests (generated disk images only; no physical disks)
+        run: python -m pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  installer:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: choco install innosetup -y --no-progress
+      - name: Build (PyInstaller, selftest, Inno Setup)
+        shell: pwsh
+        run: installer\build.ps1 -SkipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lavora-Setup
+          path: |
+            dist/Lavora-Setup.exe
+            dist/Lavora-*-portable.zip

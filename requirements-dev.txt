@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8
+ruff
+mypy
+pyinstaller>=6
+pillow>=10        # only to generate the installer artwork

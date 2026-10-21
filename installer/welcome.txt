@@ -1,0 +1,7 @@
+Lavora - get your system working again.
+
+Lavora recovers deleted files, images failing drives, repairs partition tables and boot sectors, and backs up your PC. It opens disks read-only by default and always saves an undo snapshot before it changes anything.
+
+Everything works offline and no account is needed. Raw disk access needs administrator rights, so Windows will ask for permission when you start Lavora.
+
+If Lavora is already installed, this setup updates it and keeps your settings.

@@ -1,0 +1,20 @@
+LAVORA RESCUE USB - GUIDE
+=========================
+
+Lavora Rescue is a bootable Linux-based environment that runs Lavora when the installed operating system will not start.
+
+STATUS: the Rescue ISO is NOT built yet in this version. The build recipe is in the source repository (rescue\build-iso.sh,
+Debian live-build, run in WSL2 or Docker). The USB writer below works as soon as an ISO exists.
+
+1. Get or build lavora-rescue.iso (see rescue\README.md).
+2. Plug in a USB stick of at least 4 GB. EVERYTHING ON IT WILL BE ERASED.
+3. Open an administrator Command Prompt and list disks:
+       lavora-cli disks
+   Find the stick (it is marked removable). Never pick a disk marked [system].
+4. Write the ISO (Lavora refuses non-removable and system disks, and wants the exact phrase):
+       lavora-cli rescue usb --iso lavora-rescue.iso --device \\.\PhysicalDriveN --confirm "ERASE \\.\PhysicalDriveN"
+5. Boot the sick PC from the stick (firmware boot menu, usually F12/Esc/F2), then use the wizards:
+   "PC won't boot", "I deleted files", "Forgot password", "Disk is failing", "Back up my PC".
+
+Safety rules that also apply inside Rescue: disks open read-only, recovery goes to a different drive, repairs take an undo
+snapshot first, and Lavora never bypasses BitLocker or LUKS - you need your own password or recovery key.

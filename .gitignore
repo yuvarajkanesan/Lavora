@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.venv/
+.idea/
+.vscode/
+# generated during the build
+installer/THIRD_PARTY_NOTICES.txt
+installer/generated/
+installer/brand.iss.inc
+# vendor-side licence signing key: never commit, never ship
+.keys/
+secrets/
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.claude/
+Thumbs.db
+desktop.ini
+# disk images a test run or a local session may leave behind
+*.img
+*.vhd
+*.vhdx
+*.map
