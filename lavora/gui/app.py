@@ -5,563 +5,36 @@ anything that writes asks for the same typed confirmations the CLI does.
 """
 from __future__ import annotations
 
-import itertools
 import os
 import sys
-import traceback
-from collections.abc import Callable
+import tempfile
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
-    QFileDialog,
-    QGridLayout,
     QHBoxLayout,
-    QInputDialog,
-    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__
-from ..brand import NAME, TAGLINE
-from ..core import backup, boot, disks, doctor, imaging, license, safety
-from ..core import partitions as parts
-from ..core.cancel import CancelToken
-from ..core.device import BlockSource, PartitionView, open_source
-from ..core.fs import FsError, open_filesystem
-from ..core.recovery import Estimate, iter_entries, preview, recover
+from ..brand import NAME
+from ..core import boot, license
+from ..core.device import open_source
 from ..i18n import tr
 from . import icons, theme
-
-
-class Worker(QObject):
-    done = Signal(object)
-    failed = Signal(str)
-    progress = Signal(int, int)
-
-    def __init__(self, fn: Callable[[Callable[[int, int], None]], object]):
-        super().__init__()
-        self.fn = fn
-
-    def run(self) -> None:
-        try:
-            self.done.emit(self.fn(lambda d, t: self.progress.emit(d, t)))
-        except Exception as ex:  # noqa: BLE001 - shown to the user, never swallowed silently
-            traceback.print_exc()
-            self.failed.emit(f"{type(ex).__name__}: {ex}")
-
-
-class Page(QWidget):
-    def __init__(self, win: MainWindow):
-        super().__init__()
-        self.win = win
-        self._threads: list[QThread] = []
-        self._workers: list[Worker] = []
-        self.token = CancelToken()
-        self.cancel_btn = QPushButton(tr("Cancel"))
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.clicked.connect(self.token.cancel)
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.status = QLabel("")
-        self.status.setObjectName("muted")
-        self.status.setWordWrap(True)
-
-    def run_bg(self, fn, on_done, label: str = "") -> None:
-        t = QThread(self)
-        w = Worker(fn)
-        w.moveToThread(t)
-        t.started.connect(w.run)
-
-        def on_progress(d: int, tot: int) -> None:
-            # permille, not raw bytes: QProgressBar holds a 32-bit int and a 5 TB disk is ~5e12 bytes
-            self.progress.setMaximum(1000)
-            self.progress.setValue(min(1000, int(1000 * d / tot)) if tot else 0)
-
-        def finished_ok(result: object) -> None:
-            self.cancel_btn.setVisible(False)
-            self.progress.setVisible(False)
-            on_done(result)
-            t.quit()
-
-        def finished_bad(msg: str) -> None:
-            self.cancel_btn.setVisible(False)
-            self.progress.setVisible(False)
-            self.status.setText(msg)
-            QMessageBox.warning(self, NAME, msg)
-            t.quit()
-
-        def cleanup() -> None:
-            if t in self._threads:
-                self._threads.remove(t)
-
-        w.progress.connect(on_progress)
-        w.done.connect(finished_ok)
-        w.failed.connect(finished_bad)
-        t.finished.connect(cleanup)
-        self._threads.append(t)
-        self._workers.append(w)
-        self.token.reset()
-        self.cancel_btn.setVisible(True)
-        self.progress.setVisible(True)
-        self.progress.setValue(0)
-        self.status.setText(label)
-        t.start()
-
-    def header(self, title: str, subtitle: str = "") -> QVBoxLayout:
-        lay = QVBoxLayout(self)
-        back = QPushButton("< " + tr("Home"))
-        back.clicked.connect(lambda: self.win.show_page("home"))
-        back.setFixedWidth(110)
-        t = QLabel(title)
-        t.setObjectName("title")
-        top = QHBoxLayout()
-        top.addWidget(back)
-        top.addStretch(1)
-        top.addWidget(self.cancel_btn)
-        lay.addLayout(top)
-        lay.addWidget(t)
-        if subtitle:
-            s = QLabel(subtitle)
-            s.setObjectName("muted")
-            s.setWordWrap(True)
-            lay.addWidget(s)
-        return lay
-
-
-def pick_source(parent: QWidget, edit: QLineEdit) -> None:
-    path, _ = QFileDialog.getOpenFileName(parent, tr("Choose a disk image"), "", "Disk images (*.img *.dd *.raw *.vhd *.iso);;All files (*)")
-    if path:
-        edit.setText(path)
-
-
-class SourceRow(QWidget):
-    """Choose an image file or a physical disk from the list."""
-
-    def __init__(self):
-        super().__init__()
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self.edit = QLineEdit()
-        self.edit.setPlaceholderText(tr("Image file (.img/.vhd) or \\\\.\\PhysicalDriveN"))
-        browse = QPushButton(tr("Browse image..."))
-        browse.clicked.connect(lambda: pick_source(self, self.edit))
-        lst = QPushButton(tr("Detect disks"))
-        lst.clicked.connect(self.detect)
-        self.combo = QComboBox()
-        self.combo.setVisible(False)
-        self.combo.activated.connect(lambda _i: self.edit.setText(self.combo.currentData() or ""))
-        lay.addWidget(self.edit, 1)
-        lay.addWidget(browse)
-        lay.addWidget(lst)
-        lay.addWidget(self.combo)
-
-    def detect(self) -> None:
-        try:
-            items = disks.list_disks()
-        except Exception as ex:  # noqa: BLE001
-            QMessageBox.warning(self, NAME, str(ex))
-            return
-        self.combo.clear()
-        for d in items:
-            self.combo.addItem(f"{d.path}  {d.model}  {d.size // 2 ** 30} GiB" + ("  [system]" if d.is_system else ""), d.path)
-        self.combo.setVisible(bool(items))
-        if not items:
-            QMessageBox.information(self, NAME, tr("No disks were listed. Run Lavora as administrator to see physical disks."))
-
-    @property
-    def path(self) -> str:
-        return self.edit.text().strip()
-
-
-class RecoverPage(Page):
-    def __init__(self, win: MainWindow):
-        super().__init__(win)
-        lay = self.header(tr("I deleted files"), tr("Scan a disk or image for deleted files, preview them, and recover them to a DIFFERENT drive. Nothing is written to the source."))
-        self.src = SourceRow()
-        self.part = QComboBox()
-        self.part.addItem(tr("Auto-detect volume"), None)
-        self.volumes_btn = QPushButton(tr("List volumes"))
-        self.volumes_btn.clicked.connect(self.list_volumes)
-        row = QHBoxLayout()
-        row.addWidget(self.part, 1)
-        row.addWidget(self.volumes_btn)
-        self.scan_btn = QPushButton(tr("Scan for deleted files"))
-        self.scan_btn.setObjectName("primary")
-        self.scan_btn.clicked.connect(self.scan)
-        self.carve_btn = QPushButton(tr("Deep scan (by file type)"))
-        self.carve_btn.clicked.connect(self.carve)
-        self.filter = QLineEdit()
-        self.filter.setPlaceholderText(tr("Filter by name or type, e.g. jpg"))
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(300)
-        self._debounce.timeout.connect(self.apply_filter)
-        self.filter.textChanged.connect(lambda _t: self._debounce.start())
-        self.include_live = QCheckBox(tr("Also list existing files (slower, more memory)"))
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels([tr("Name"), tr("Size"), tr("State"), tr("Chance"), tr("Path")])
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.itemSelectionChanged.connect(self.show_preview)
-        self.prev = QPlainTextEdit()
-        self.prev.setReadOnly(True)
-        self.prev.setMaximumHeight(130)
-        self.prev_img = QLabel()
-        self.prev_img.setMaximumHeight(130)
-        self.recover_btn = QPushButton(tr("Recover selected to..."))
-        self.recover_btn.setObjectName("primary")
-        self.recover_btn.clicked.connect(self.do_recover)
-        btns = QHBoxLayout()
-        btns.addWidget(self.scan_btn)
-        btns.addWidget(self.carve_btn)
-        for w in (self.src,):
-            lay.addWidget(w)
-        lay.addLayout(row)
-        lay.addLayout(btns)
-        lay.addWidget(self.include_live)
-        lay.addWidget(self.filter)
-        lay.addWidget(self.table, 1)
-        pv = QHBoxLayout()
-        pv.addWidget(self.prev, 1)
-        pv.addWidget(self.prev_img)
-        lay.addLayout(pv)
-        lay.addWidget(self.recover_btn)
-        lay.addWidget(self.progress)
-        lay.addWidget(self.status)
-        self.entries: list = []
-        self.fs = None
-        self.vol: BlockSource | None = None
-        self.carved: list = []
-
-    def _volume(self) -> BlockSource:
-        src = open_source(self.src.path)
-        sel = self.part.currentData()
-        if sel is not None:
-            return PartitionView(src, sel[0], sel[1])
-        if parts.identify_fs(src, 0):
-            return src
-        _s, plist = parts.read_partitions(src)
-        plist = [p for p in plist if p.fs]
-        if len(plist) == 1:
-            return PartitionView(src, plist[0].start, plist[0].size)
-        raise FsError(tr("Several volumes (or none) found. Use 'List volumes' and pick one."))
-
-    def list_volumes(self) -> None:
-        try:
-            with open_source(self.src.path) as src:
-                scheme, plist = parts.read_partitions(src)
-                found = [] if plist else parts.scan_lost_partitions(src, max_bytes=256 * 1024 * 1024)
-            self.part.clear()
-            self.part.addItem(tr("Auto-detect volume"), None)
-            for p in plist:
-                self.part.addItem(f"#{p.index} {p.fs or '?'} {p.size // 2 ** 20} MiB ({scheme})", (p.start, p.size))
-            for f in found:
-                self.part.addItem(f"{tr('found')}: {f.fs} {f.size // 2 ** 20} MiB ({f.confidence})", (f.start, f.size))
-        except Exception as ex:  # noqa: BLE001
-            QMessageBox.warning(self, NAME, str(ex))
-
-    MAX_ENTRIES = 2_000_000  # the list lives in memory; a 5 TB disk can hold more files than that
-
-    def scan(self) -> None:
-        live = self.include_live.isChecked()
-
-        def job(progress):
-            vol = self._volume()
-            fs = open_filesystem(vol)
-            out = list(itertools.islice(fs.scan(include_live=live, progress=progress, cancel=self.token), self.MAX_ENTRIES + 1))
-            return vol, fs, out
-        self.run_bg(job, self.scanned, tr("Reading the file table... (you can cancel; what was found so far is kept)"))
-
-    def scanned(self, res) -> None:
-        self.vol, self.fs, self.entries = res
-        capped = len(self.entries) > self.MAX_ENTRIES
-        if capped:
-            self.entries = self.entries[:self.MAX_ENTRIES]
-        self.carved = []
-        est = Estimate()
-        for e in self.entries:
-            est.add(e)
-        note = (" " + tr("[stopped early: partial list]")) if self.token.cancelled else (" " + tr("[list capped; use the CLI for the rest]") if capped else "")
-        self.status.setText(tr("{n} files, {d} deleted: {g} look intact, {p} partly overwritten, {l} overwritten.").format(
-            n=est.files, d=est.deleted, g=est.good, p=est.partial, l=est.lost) + note)
-        self.apply_filter()
-
-    def carve(self) -> None:
-        from ..core import carver
-
-        def job(progress):
-            src = open_source(self.src.path)
-            found = list(itertools.islice(carver.carve(src, progress=progress, cancel=self.token), self.MAX_ENTRIES))
-            return src, found
-        self.run_bg(job, self.carved_done, tr("Scanning for file signatures... (cancel any time; found files are kept)"))
-
-    def carved_done(self, res) -> None:
-        self.vol, self.carved = res
-        self.entries, self.fs = [], None
-        self.table.setRowCount(0)
-        for c in self.carved[:5000]:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            for i, v in enumerate([c.name, str(c.size), tr("carved"), "?", f"offset {c.offset}"]):
-                self.table.setItem(r, i, QTableWidgetItem(v))
-        self.status.setText(tr("{n} files found by signature.").format(n=len(self.carved)) +
-                            ((" " + tr("[stopped early]")) if self.token.cancelled else ""))
-
-    def apply_filter(self) -> None:
-        if self.carved:
-            return
-        # lazy + capped at 5000 rows: filtering millions of entries must never block the window
-        shown = list(itertools.islice(iter_entries(self.entries, name_contains=self.filter.text().strip()), 5000))
-        self.shown = shown
-        self.table.setUpdatesEnabled(False)
-        self.table.setRowCount(0)
-        for e in shown:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            chance = "-" if not e.deleted else (tr("lost") if e.overwritten_pct >= 100 else tr("good") if e.overwritten_pct == 0 else f"{100 - e.overwritten_pct:.0f}%")
-            for i, v in enumerate([e.name, str(e.size), tr("deleted") if e.deleted else tr("present"), chance, e.path]):
-                self.table.setItem(r, i, QTableWidgetItem(v))
-        self.table.setUpdatesEnabled(True)
-
-    def show_preview(self) -> None:
-        rows = {i.row() for i in self.table.selectedItems()}
-        if len(rows) != 1 or not self.fs or not hasattr(self, "shown"):
-            return
-        e = self.shown[next(iter(rows))]
-        try:
-            p = preview(self.fs, e)
-        except Exception as ex:  # noqa: BLE001
-            self.prev.setPlainText(str(ex))
-            return
-        self.prev_img.clear()
-        if p["kind"] == "image":
-            pm = QPixmap()
-            if pm.loadFromData(p["data"]):
-                self.prev_img.setPixmap(pm.scaledToHeight(120, Qt.SmoothTransformation))
-            self.prev.setPlainText(tr("Image preview"))
-        else:
-            self.prev.setPlainText(p["data"])
-
-    def do_recover(self) -> None:
-        out = QFileDialog.getExistingDirectory(self, tr("Recover to (choose a different drive)"))
-        if not out or not self.vol:
-            return
-        rows = sorted({i.row() for i in self.table.selectedItems()})
-        if not rows:
-            QMessageBox.information(self, NAME, tr("Select the files to recover first."))
-            return
-        lic = license.current()
-
-        def job(progress):
-            if self.carved:
-                from ..core import carver
-                safety.check_output_location(self.vol, out)
-                done = []
-                for r in rows:
-                    if self.token():
-                        break
-                    done.append(carver.extract(self.vol, self.carved[r], out))
-                return done
-            return recover(self.fs, [self.shown[r] for r in rows], out, source=self.vol, license=lic, cancel=self.token,
-                           byte_progress=progress)  # progress inside the current file, so a 2 TB file shows movement
-        def finished(rep) -> None:
-            n = len(rep) if isinstance(rep, list) else rep.recovered
-            extra = ""
-            if not isinstance(rep, list):
-                extra = (" " + tr("[cancelled]") if rep.cancelled else "") + (" " + rep.stopped_reason if rep.stopped_reason else "")
-                extra += (" " + tr("{f} failed.").format(f=rep.failed)) if rep.failed else ""
-            self.status.setText(tr("Recovered {n} file(s) to {p}").format(n=n, p=out) + extra)
-
-        self.run_bg(job, finished, tr("Recovering... (you can cancel; no half-written files are left)"))
-
-
-class DoctorPage(Page):
-    def __init__(self, win: MainWindow):
-        super().__init__(win)
-        lay = self.header(tr("PC won't boot - Lavora Doctor"), tr("Scans partition tables, boot sectors and boot files, then proposes ranked fixes. Every fix takes an undo snapshot first."))
-        self.src = SourceRow()
-        self.run_btn = QPushButton(tr("Diagnose"))
-        self.run_btn.setObjectName("primary")
-        self.run_btn.clicked.connect(self.diagnose)
-        self.list = QTableWidget(0, 3)
-        self.list.setHorizontalHeaderLabels([tr("Severity"), tr("Problem"), tr("Fix")])
-        self.list.horizontalHeader().setStretchLastSection(True)
-        self.dry = QCheckBox(tr("Dry run (show what would change, write nothing)"))
-        self.dry.setChecked(True)
-        self.apply_btn = QPushButton(tr("Apply selected fix"))
-        self.apply_btn.clicked.connect(self.apply)
-        self.undo_btn = QPushButton(tr("Undo last fix"))
-        self.undo_btn.clicked.connect(self.undo_last)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        lay.addWidget(self.src)
-        lay.addWidget(self.run_btn)
-        lay.addWidget(self.list, 1)
-        lay.addWidget(self.dry)
-        row = QHBoxLayout()
-        row.addWidget(self.apply_btn)
-        row.addWidget(self.undo_btn)
-        lay.addLayout(row)
-        lay.addWidget(self.log)
-        lay.addWidget(self.progress)
-        lay.addWidget(self.status)
-        self.rows: list = []
-        self.last_undo: str | None = None
-
-    def diagnose(self) -> None:
-        try:
-            license.current().require("doctor")
-        except license.LicenseRequired as ex:
-            QMessageBox.information(self, NAME, str(ex))
-            return
-
-        def job(progress):
-            with open_source(self.src.path) as s:
-                return doctor.diagnose(s, cancel=self.token, progress=progress)
-        self.run_bg(job, self.show_findings, tr("Diagnosing..."))
-
-    def show_findings(self, findings) -> None:
-        self.rows = [(f, fx) for f in findings for fx in (f.fixes or [None])]
-        self.list.setRowCount(0)
-        for f, fx in self.rows:
-            r = self.list.rowCount()
-            self.list.insertRow(r)
-            for i, v in enumerate([f.severity.upper(), f"{f.title}: {f.detail}", (fx.title if fx else "-") + ("" if not fx or fx.auto else " (manual plan)")]):
-                self.list.setItem(r, i, QTableWidgetItem(v))
-        self.status.setText(tr("No problems found.") if not findings else tr("{n} finding(s).").format(n=len(findings)))
-
-    def apply(self) -> None:
-        r = self.list.currentRow()
-        if r < 0 or self.rows[r][1] is None:
-            return
-        fx = self.rows[r][1]
-        if not fx.auto:
-            self.log.setPlainText(tr("This is a plan, not an automatic fix. Run these yourself:") + "\n" + "\n".join(fx.commands))
-            return
-        if not self.dry.isChecked() and self.src.path.lower().startswith("\\\\.\\physicaldrive"):
-            text, ok = QInputDialog.getText(self, NAME, tr('This writes to a physical disk. Type "APPLY {id}" to continue.').format(id=fx.id))
-            if not ok or text.strip().lower() != f"apply {fx.id}".lower():
-                return
-        res = doctor.apply_fix(self.src.path, fx, dry_run=self.dry.isChecked())
-        if res.applied:
-            self.last_undo = res.undo_id
-            self.log.setPlainText(tr("Applied. Undo id: {u}").format(u=res.undo_id))
-        else:
-            self.log.setPlainText(tr("Dry run: would write ") + ", ".join(f"{n} bytes at {o}" for o, n in res.plan))
-
-    def undo_last(self) -> None:
-        from ..core import undo
-        snaps = undo.list_snapshots()
-        if not snaps:
-            self.log.setPlainText(tr("Nothing to undo."))
-            return
-        target = undo.undo(snaps[-1]["id"])
-        self.log.setPlainText(tr("Restored {t} from snapshot {s}").format(t=target, s=snaps[-1]["id"]))
-
-
-class ImagePage(Page):
-    def __init__(self, win: MainWindow):
-        super().__init__(win)
-        lay = self.header(tr("Disk is failing"), tr("Make a sector-by-sector image first (bad sectors are mapped and retried), then scan and recover from the image."))
-        self.src = SourceRow()
-        self.dest = QLineEdit()
-        self.dest.setPlaceholderText(tr("Where to save the image (on a DIFFERENT drive)"))
-        b = QPushButton(tr("Choose..."))
-        b.clicked.connect(lambda: self.dest.setText(QFileDialog.getSaveFileName(self, tr("Image file"), "", "Disk image (*.img)")[0]))
-        go = QPushButton(tr("Create image"))
-        go.setObjectName("primary")
-        go.clicked.connect(self.go)
-        row = QHBoxLayout()
-        row.addWidget(self.dest, 1)
-        row.addWidget(b)
-        lay.addWidget(self.src)
-        lay.addLayout(row)
-        lay.addWidget(go)
-        lay.addWidget(self.progress)
-        lay.addWidget(self.status)
-        lay.addStretch(1)
-
-    def go(self) -> None:
-        try:
-            license.current().require("imaging")
-        except license.LicenseRequired as ex:
-            QMessageBox.information(self, NAME, str(ex))
-            return
-        dest = self.dest.text().strip()
-        if not dest:
-            return
-
-        def job(progress):
-            with open_source(self.src.path) as s:
-                return imaging.ImageJob(s, dest, cancel_fn=self.token).run(progress)
-        self.run_bg(job, lambda r: self.status.setText(tr("Image {p}: complete={c}, bad bytes={b}").format(p=r.path, c=r.complete, b=r.bad_bytes) +
-                                       ((" " + tr("[stopped: press Create image again to resume]")) if r.cancelled else "")),
-                    tr("Imaging..."))
-
-
-class BackupPage(Page):
-    def __init__(self, win: MainWindow):
-        super().__init__(win)
-        lay = self.header(tr("Back up my PC"), tr("Incremental, compressed, optionally AES-256 encrypted file backups with a test-restore check."))
-        self.folder = QLineEdit()
-        self.folder.setPlaceholderText(tr("Folder to back up"))
-        fb = QPushButton(tr("Choose..."))
-        fb.clicked.connect(lambda: self.folder.setText(QFileDialog.getExistingDirectory(self, tr("Folder to back up"))))
-        self.dest = QLineEdit()
-        self.dest.setPlaceholderText(tr("Backup destination (external drive or network share)"))
-        db = QPushButton(tr("Choose..."))
-        db.clicked.connect(lambda: self.dest.setText(QFileDialog.getExistingDirectory(self, tr("Destination"))))
-        self.pw = QLineEdit()
-        self.pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pw.setPlaceholderText(tr("Password (leave empty for no encryption)"))
-        go = QPushButton(tr("Back up and verify"))
-        go.setObjectName("primary")
-        go.clicked.connect(self.go)
-        for a, b in ((self.folder, fb), (self.dest, db)):
-            r = QHBoxLayout()
-            r.addWidget(a, 1)
-            r.addWidget(b)
-            lay.addLayout(r)
-        lay.addWidget(self.pw)
-        lay.addWidget(go)
-        lay.addWidget(self.progress)
-        lay.addWidget(self.status)
-        lay.addStretch(1)
-
-    def go(self) -> None:
-        try:
-            license.current().require("backup")
-        except license.LicenseRequired as ex:
-            QMessageBox.information(self, NAME, str(ex))
-            return
-        folder, dest, pw = self.folder.text().strip(), self.dest.text().strip(), self.pw.text() or None
-
-        def job(progress):
-            try:
-                repo = backup.Repository.open(dest, pw)
-            except backup.BackupError:
-                repo = backup.Repository.init(dest, pw)
-            st = backup.backup(repo, [folder], cancel=self.token)
-            if st.cancelled:
-                return st, None
-            return st, backup.verify_backup(repo, st.snapshot_id)
-        self.run_bg(job, lambda r: self.status.setText(
-            tr("Backed up {n} files. Test restore: {v}").format(n=r[0].files, v=tr("OK") if r[1].ok else tr("FAILED"))
-            if r[1] else tr("Cancelled: no snapshot was written; run again to continue (stored data is reused).")), tr("Backing up..."))
+from .base import Page, SourceRow, Worker  # noqa: F401 - Worker re-exported for callers
+from .home import HomePage
+from .pages import BackupPage, DoctorPage, ImagePage, PasswordPage, RaidPage
+from .recover_page import RecoverPage
+from .widgets import TopBar
 
 
 class BootPage(Page):
@@ -589,16 +62,6 @@ class BootPage(Page):
 
     def show_plan(self) -> None:
         self.out.setPlainText(self.kinds[self.kind.currentText()]().as_text())
-
-
-class PasswordPage(Page):
-    def __init__(self, win: MainWindow):
-        super().__init__(win)
-        lay = self.header(tr("Forgot password"), tr("Owner-only. You must confirm that this is your own device. Microsoft and domain accounts and encrypted volumes are never bypassed. Every attempt is written to an audit log."))
-        msg = QLabel(tr("Linux: reset a user's password inside a mounted root with `lavora-cli account linux <mounted-root> <user> --attest \"this is my device\" --apply` (from Lavora Rescue).\n\nWindows local-account reset is not available in this version. For a Microsoft account use account.live.com/password/reset."))
-        msg.setWordWrap(True)
-        lay.addWidget(msg)
-        lay.addStretch(1)
 
 
 class EditorPage(Page):
@@ -683,134 +146,57 @@ class EditorPage(Page):
         self.run_bg(job, done, tr("Searching... (cancel any time)"))
 
 
-class RaidPage(Page):
-    def __init__(self, win: MainWindow):
-        super().__init__(win)
-        lay = self.header(tr("RAID builder"), tr("Add the member disks or images (any order). Lavora finds the RAID level, chunk size, layout and member order, then you can scan and recover from the rebuilt array. Missing members are rebuilt from parity when the level allows."))
-        self.members = QPlainTextEdit()
-        self.members.setPlaceholderText(tr("One member per line: image file or \\\\.\\PhysicalDriveN"))
-        add = QPushButton(tr("Add images..."))
-        add.clicked.connect(self.add_files)
-        self.level = QComboBox()
-        self.level.addItem(tr("Auto-detect level"), None)
-        for lv in (0, 1, 5, 6, 10):
-            self.level.addItem(f"RAID {lv}", lv)
-        go = QPushButton(tr("Detect parameters"))
-        go.setObjectName("primary")
-        go.clicked.connect(self.detect)
-        self.out = QPlainTextEdit()
-        self.out.setReadOnly(True)
-        use = QPushButton(tr("Use the best result in 'I deleted files'"))
-        use.clicked.connect(self.use_best)
-        row = QHBoxLayout()
-        row.addWidget(add)
-        row.addWidget(self.level)
-        row.addWidget(go)
-        lay.addWidget(self.members, 1)
-        lay.addLayout(row)
-        lay.addWidget(self.out, 1)
-        lay.addWidget(use)
-        lay.addWidget(self.progress)
-        lay.addWidget(self.status)
-        self.best_spec = ""
-
-    def add_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, tr("Member images"), "", "Disk images (*.img *.dd *.raw *.vhd *.vhdx *.vmdk *.vdi);;All files (*)")
-        if paths:
-            self.members.appendPlainText("\n".join(paths))
-
-    def detect(self) -> None:
-        from ..core import raid
-        paths = [p.strip() for p in self.members.toPlainText().splitlines() if p.strip()]
-        lv = self.level.currentData()
-
-        def job(_progress):
-            mem = [open_source(p) for p in paths]
-            try:
-                return paths, raid.detect(mem, levels=None if lv is None else (lv,))
-            finally:
-                for m in mem:
-                    m.close()
-
-        def done(res) -> None:
-            ps, cands = res
-            if not cands:
-                self.out.setPlainText(tr("No layout produced a recognisable partition table or filesystem. Check that all members are present."))
-                self.best_spec = ""
-                return
-            self.out.setPlainText("\n".join(f"{i + 1}. {c.describe()}" for i, c in enumerate(cands)))
-            b = cands[0]
-            self.best_spec = raid.spec_for(b.level, b.chunk, b.layout, [ps[i] for i in b.order])
-            self.status.setText(self.best_spec)
-
-        self.run_bg(job, done, tr("Trying chunk sizes, layouts and member orders..."))
-
-    def use_best(self) -> None:
-        if not self.best_spec:
-            QMessageBox.information(self, NAME, tr("Run 'Detect parameters' first."))
-            return
-        page = self.win.pages["recover"]
-        page.src.edit.setText(self.best_spec)  # type: ignore[attr-defined]
-        self.win.show_page("recover")
-
-
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, theme_name: str = "light") -> None:
         super().__init__()
+        self.theme_name = theme_name
         self.setWindowTitle(f"{NAME} {__version__}")
-        self.resize(1000, 720)
+        self.resize(1360, 900)
+        self.setMinimumSize(980, 640)
+        root = QWidget()
+        root.setObjectName("root")
+        col = QVBoxLayout(root)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        lic = license.current()
+        self.topbar = TopBar(__version__, lic.is_pro, theme_name, tr("Pro licence") if lic.is_pro else tr("Free tier"), tr("Read-only mode"))
+        col.addWidget(self.topbar)
         self.stack = QStackedWidget()
-        self.setCentralWidget(self.stack)
-        self.pages: dict[str, QWidget] = {"home": self._home()}
+        col.addWidget(self.stack, 1)
+        self.setCentralWidget(root)
+        self.pages: dict[str, QWidget] = {"home": HomePage(self)}
         for key, cls in (("recover", RecoverPage), ("doctor", DoctorPage), ("image", ImagePage), ("backup", BackupPage),
                          ("boot", BootPage), ("password", PasswordPage), ("editor", EditorPage), ("raid", RaidPage)):
             self.pages[key] = cls(self)
-        for p in self.pages.values():
-            self.stack.addWidget(p)
+        for page in self.pages.values():
+            self.stack.addWidget(page)
+        self._pin_control_heights()
         self.show_page("home")
+
+    def _pin_control_heights(self) -> None:
+        """Style-sheet min-height is not part of a widget's minimum size hint, so layouts could squeeze buttons and inputs.
+        Pin the heights in code so every control keeps the size the design calls for."""
+        heights = {"primary": 52, "chipBtn": 44, "link": 28, "crumb": 28}
+        for b in self.findChildren(QPushButton):
+            b.setMinimumHeight(heights.get(b.objectName(), 46))
+        for edit in self.findChildren(QLineEdit):
+            edit.setMinimumHeight(48)
+        for combo in self.findChildren(QComboBox):
+            combo.setMinimumHeight(48)
 
     def show_page(self, key: str) -> None:
         self.stack.setCurrentWidget(self.pages[key])
 
-    def _home(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        t = QLabel(NAME)
-        t.setObjectName("title")
-        s = QLabel(tr(TAGLINE.split(" - ", 1)[1].capitalize()))
-        s.setObjectName("muted")
-        lic = license.current()
-        tier = QLabel(tr("Pro licence") if lic.is_pro else tr("Free tier - scan, preview, recover up to 256 MiB, basic repair"))
-        tier.setObjectName("muted")
-        lay.addWidget(t)
-        lay.addWidget(s)
-        lay.addWidget(tier)
-        grid = QGridLayout()
-        accent = theme.PALETTES[detect_theme(QApplication.instance())]["accent"]  # type: ignore[arg-type]
-        tiles = [("boot", tr("PC won't boot\nDiagnose and repair boot problems")), ("recover", tr("I deleted files\nScan, preview and recover")),
-                 ("password", tr("Forgot password\nOwner-only account access")), ("image", tr("Disk is failing\nImage it first, recover from the image")),
-                 ("backup", tr("Back up my PC\nIncremental, encrypted, verified")),
-                 ("raid", tr("RAID builder\nRebuild an array from its disks")), ("editor", tr("Disk editor\nHex view, search, decode"))]
-        for i, (key, text) in enumerate(tiles):
-            b = QPushButton(text)
-            b.setObjectName("tile")
-            b.setIcon(icons.tile_icon(key, accent))
-            b.setIconSize(QSize(48, 48))
-            target = "doctor" if key == "boot" else key
-            b.clicked.connect(lambda _c=False, k=target: self.show_page(k))
-            grid.addWidget(b, i // 2, i % 2)
-        b = QPushButton(tr("Boot repair plans\nWindows and Linux commands"))
-        b.setObjectName("tile")
-        b.setIcon(icons.tile_icon("plans", accent))
-        b.setIconSize(QSize(48, 48))
-        b.clicked.connect(lambda: self.show_page("boot"))
-        grid.addWidget(b, 3, 0)
-        lay.addLayout(grid)
-        lay.addStretch(1)
-        note = QLabel(tr("Read-only by default. Recovery always goes to a different drive. No telemetry."))
-        note.setObjectName("muted")
-        lay.addWidget(note)
-        return w
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        """Stop background work and let worker threads finish before Qt tears everything down (avoids a crash on exit)."""
+        for page in self.pages.values():
+            token = getattr(page, "token", None)
+            if token is not None:
+                token.cancel()
+            for t in list(getattr(page, "_threads", [])):
+                t.quit()
+                t.wait(3000)
+        super().closeEvent(event)
 
 
 def detect_theme(app: QApplication) -> str:
@@ -820,16 +206,27 @@ def detect_theme(app: QApplication) -> str:
         return "light"
 
 
+def _asset_pngs(muted: str) -> tuple[str, str]:
+    """Check tick and dropdown chevron as image files (Qt style sheets can only reference files)."""
+    tmp = tempfile.gettempdir()
+    check, arrow = os.path.join(tmp, "lavora-check.png"), os.path.join(tmp, "lavora-chevron-down.png")
+    icons.glyph_pixmap("check", "#ffffff", 20, 12).save(check, "PNG")
+    icons.glyph_pixmap("chevron-down", muted, 14, 12).save(arrow, "PNG")
+    return check.replace("\\", "/"), arrow.replace("\\", "/")
+
+
 def build_window(app: QApplication) -> MainWindow:
-    app.setStyleSheet(theme.stylesheet(detect_theme(app)))
-    return MainWindow()
+    name = detect_theme(app)
+    check, arrow = _asset_pngs(theme.PALETTES[name]["muted"])
+    app.setStyleSheet(theme.stylesheet(name, check, arrow))
+    return MainWindow(name)
 
 
 def run() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(NAME)
     win = build_window(app)  # type: ignore[arg-type]
-    win.show()
+    win.showMaximized()  # opens maximized by default
     return app.exec()
 
 

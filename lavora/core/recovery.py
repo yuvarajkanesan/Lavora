@@ -61,7 +61,7 @@ def preview(fs: Filesystem, entry: FileEntry, limit: int = 64 * 1024) -> dict:
     """{'kind': 'image'|'text'|'hex', 'data': bytes|str} for a file, without writing anything."""
     data = fs.read(entry, 0, limit)
     if entry.extension in IMAGE_EXT or data[:4] in (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\x89PNG", b"GIF8"):
-        return {"kind": "image", "data": fs.read(entry, 0, min(entry.size, 16 * 1024 * 1024))}
+        return {"kind": "image", "data": fs.read(entry, 0, min(entry.size, 8 * 1024 * 1024))}
     printable = set(string.printable.encode())
     if data and sum(b in printable for b in data) / len(data) > 0.95:
         return {"kind": "text", "data": data.decode("utf-8", "replace")}
