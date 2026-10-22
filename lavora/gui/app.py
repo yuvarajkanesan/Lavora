@@ -10,7 +10,7 @@ import sys
 import traceback
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,7 +42,7 @@ from ..core.device import BlockSource, PartitionView, open_source
 from ..core.fs import FsError, open_filesystem
 from ..core.recovery import filter_entries, preview, recover
 from ..i18n import tr
-from . import theme
+from . import icons, theme
 
 
 class Worker(QObject):
@@ -578,17 +578,22 @@ class MainWindow(QMainWindow):
         lay.addWidget(s)
         lay.addWidget(tier)
         grid = QGridLayout()
+        accent = theme.PALETTES[detect_theme(QApplication.instance())]["accent"]  # type: ignore[arg-type]
         tiles = [("boot", tr("PC won't boot\nDiagnose and repair boot problems")), ("recover", tr("I deleted files\nScan, preview and recover")),
                  ("password", tr("Forgot password\nOwner-only account access")), ("image", tr("Disk is failing\nImage it first, recover from the image")),
                  ("backup", tr("Back up my PC\nIncremental, encrypted, verified"))]
         for i, (key, text) in enumerate(tiles):
             b = QPushButton(text)
             b.setObjectName("tile")
+            b.setIcon(icons.tile_icon(key, accent))
+            b.setIconSize(QSize(48, 48))
             target = "doctor" if key == "boot" else key
             b.clicked.connect(lambda _c=False, k=target: self.show_page(k))
             grid.addWidget(b, i // 2, i % 2)
         b = QPushButton(tr("Boot repair plans\nWindows and Linux commands"))
         b.setObjectName("tile")
+        b.setIcon(icons.tile_icon("plans", accent))
+        b.setIconSize(QSize(48, 48))
         b.clicked.connect(lambda: self.show_page("boot"))
         grid.addWidget(b, 2, 1)
         lay.addLayout(grid)
