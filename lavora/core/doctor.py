@@ -129,7 +129,7 @@ def _check_esp(source: BlockSource, p: Partition) -> list[Finding]:
     return []
 
 
-def diagnose(source: BlockSource, *, smart: SmartReport | None = None) -> list[Finding]:
+def diagnose(source: BlockSource, *, smart: SmartReport | None = None, cancel=None, progress=None) -> list[Finding]:
     findings: list[Finding] = []
     size = source.size
     mbr = source.read_at(0, SECTOR)
@@ -150,7 +150,7 @@ def diagnose(source: BlockSource, *, smart: SmartReport | None = None) -> list[F
                                          "Rewrites only the GPT header and entry array of the damaged copy.",
                                          gpt_repair_regions(source))]))
         else:
-            found = scan_lost_partitions(source)
+            found = scan_lost_partitions(source, cancel=cancel, progress=progress)
             fixes = []
             if found:
                 parts = [Partition(i + 1, f.start, f.size, "found", f.fs, f.fs) for i, f in enumerate(found)]
@@ -165,14 +165,14 @@ def diagnose(source: BlockSource, *, smart: SmartReport | None = None) -> list[F
                                     f"{len(found)} volume(s) can still be found by scanning." if found
                                     else "No volumes were found by scanning.", fixes))
         volumes = info.entries or [Partition(i + 1, f.start, f.size, "found", f.fs, f.fs)
-                                   for i, f in enumerate(scan_lost_partitions(source))]
+                                   for i, f in enumerate(scan_lost_partitions(source, cancel=cancel, progress=progress))]
     elif mbr[510:512] == b"\x55\xaa" and parse_mbr(mbr):
         volumes = parse_mbr(mbr)
     else:
         if identify_fs(source, 0):
             volumes = [Partition(1, 0, size, "none", fs=identify_fs(source, 0))]
         else:
-            found = scan_lost_partitions(source)
+            found = scan_lost_partitions(source, cancel=cancel, progress=progress)
             fixes = []
             if found and len(found) <= 4:
                 parts = [Partition(i + 1, f.start, f.size, "found", f.fs, f.fs, bootable=i == 0)

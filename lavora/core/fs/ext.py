@@ -7,8 +7,9 @@ count). Journal replay is not attempted, so ext3/ext4 results are best-effort an
 """
 from __future__ import annotations
 
+import bisect
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 
 from ..device import BlockSource
@@ -59,13 +60,24 @@ class ExtFilesystem(Filesystem):
             self._gd.append((bb, it))
         self.has_journal = bool(struct.unpack_from("<I", sb, 92)[0] & 0x4)
         self._bitmaps: dict[int, bytes] = {}
+        self._pages: dict[tuple[int, int], bytes] = {}  # inode-table pages (256 inodes) so tree walks do not read per inode
+        self._run_cache: tuple[int, list[tuple[int, int, int]]] | None = None
 
     # ---------------------------------------------------------------- inodes
     def _inode_raw(self, n: int) -> bytes | None:
         g, idx = divmod(n - 1, self.ipg)
         if g >= len(self._gd):
             return None
-        raw = self.source.read_at(self._gd[g][1] * self.bs + idx * self.inode_size, self.inode_size)
+        page, slot = divmod(idx, 256)
+        key = (g, page)
+        data = self._pages.get(key)
+        if data is None:
+            if len(self._pages) > 512:
+                self._pages.clear()
+            first = page * 256
+            count = min(256, self.ipg - first)
+            data = self._pages[key] = self.source.read_at(self._gd[g][1] * self.bs + first * self.inode_size, count * self.inode_size)
+        raw = data[slot * self.inode_size:(slot + 1) * self.inode_size]
         return raw if len(raw) == self.inode_size else None
 
     @staticmethod
@@ -142,12 +154,37 @@ class ExtFilesystem(Filesystem):
     def _read_runs(self, runs: list[tuple[int, int, int]], size: int, offset: int, length: int) -> bytes:
         length = max(0, min(length, size - offset))
         out = bytearray(length)
-        for lblk, pblk, ln in runs:
+        if not length or not runs:
+            return bytes(out)
+        ordered = all(runs[i][0] <= runs[i + 1][0] for i in range(len(runs) - 1))
+        if not ordered:
+            runs = sorted(runs)
+        starts = [r[0] * self.bs for r in runs]
+        i = max(0, bisect.bisect_right(starts, offset) - 1)
+        while i < len(runs) and starts[i] < offset + length:
+            lblk, pblk, ln = runs[i]
             start, end = lblk * self.bs, (lblk + ln) * self.bs
             lo, hi = max(start, offset), min(end, offset + length)
             if lo < hi:
                 out[lo - offset:hi - offset] = self.source.read_at(pblk * self.bs + (lo - start), hi - lo)
+            i += 1
         return bytes(out)
+
+    def _runs_allocated_pct(self, runs: list[tuple[int, int, int]], limit: int = 4096) -> float:
+        """Share of the file's blocks that are allocated now (exact when small, a 4096-point sample for huge files)."""
+        total = sum(ln for _l, _p, ln in runs)
+        if not total:
+            return 0.0
+        step = max(1, total // limit)
+        hit = seen = 0
+        idx = 0
+        for _l, p, ln in runs:
+            first = (-idx) % step  # keep a global sampling stride across runs
+            for k in range(first, ln, step):
+                seen += 1
+                hit += self._block_allocated(p + k)
+            idx += ln
+        return 100.0 * hit / seen if seen else 0.0
 
     def _block_allocated(self, b: int) -> bool:
         g, idx = divmod(b - self.first_data_block, self.bpg)
@@ -190,42 +227,47 @@ class ExtFilesystem(Filesystem):
         data = self._read_runs(self._extents(f, False), f["size"], 0, f["size"])
         return [data[i:i + self.bs] for i in range(0, len(data), self.bs)]
 
-    def scan(self, *, include_live: bool = True, progress=None) -> Iterator[FileEntry]:
-        live: dict[int, str] = {2: ""}
+    def scan(self, *, include_live: bool = True, progress=None, cancel: Callable[[], bool] | None = None) -> Iterator[FileEntry]:
+        live: dict[int, str] = {2: ""}  # directories only: files do not need to be remembered
         names: dict[int, tuple[int, str]] = {}  # deleted-name candidates: inode -> (parent inode, name)
         stack = [2]
         while stack:
+            if cancel and cancel():
+                return
             d = stack.pop()
             for blk in self._dir_blocks(d):
                 for ino, name, hidden in self._entries(blk, True):
                     if name in (".", ".."):
                         continue
                     if hidden:
-                        names.setdefault(ino, (d, name))
+                        if len(names) < 5_000_000:
+                            names.setdefault(ino, (d, name))
                         continue
                     raw = self._inode_raw(ino)
                     if raw is None:
                         continue
                     f = self._fields(raw)
                     path = f"{live[d]}/{name}" if live[d] else name
-                    if ino in live:
-                        continue
-                    live[ino] = path
                     is_dir = f["mode"] & S_IFMT == S_IFDIR
                     if is_dir:
+                        if ino in live:
+                            continue
+                        live[ino] = path
                         stack.append(ino)
                     if include_live and f["mode"] & S_IFMT in (S_IFREG, S_IFDIR):
                         yield FileEntry(path, name, 0 if is_dir else f["size"], is_dir, False, _ts(f["mtime"]),
                                         _ts(f["ctime"]), ino, "ext")
         total = self.ipg * len(self._gd)
         for n in range(1, total + 1):
-            if n in live:
-                continue
+            if cancel and n % 4096 == 0 and cancel():
+                return
             raw = self._inode_raw(n)
-            if raw is None:
+            if raw is None or not raw[20] | raw[21] | raw[22] | raw[23]:  # dtime == 0: not deleted (the common case, skipped cheaply)
+                if progress and n % 65536 == 0:
+                    progress(n, total)
                 continue
             f = self._fields(raw)
-            if not (f["dtime"] and f["mode"] & S_IFMT == S_IFREG and f["size"]):
+            if not (f["mode"] & S_IFMT == S_IFREG and f["size"]):
                 continue
             parent, name = names.get(n, (0, f"inode-{n}"))
             base = live.get(parent, "$OrphanFiles")
@@ -235,12 +277,9 @@ class ExtFilesystem(Filesystem):
             if not runs:
                 fe.note = "unsupported: block locations were cleared on delete (journal replay not implemented)"
             else:
-                blocks = [b for _l, p, ln in runs for b in range(p, p + ln)]
-                fe.overwritten_pct = 100.0 * sum(self._block_allocated(b) for b in blocks) / len(blocks)
+                fe.overwritten_pct = self._runs_allocated_pct(runs)
                 if self.has_journal:
                     fe.note = "best effort (journalled filesystem)"
-            if progress and n % 4096 == 0:
-                progress(n, total)
             yield fe
 
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
@@ -249,4 +288,6 @@ class ExtFilesystem(Filesystem):
             raise FsError(f"inode {entry.ref} unreadable")
         f = self._fields(raw)
         length = entry.size - offset if length is None else length
-        return self._read_runs(self._extents(f, entry.deleted), min(f["size"], entry.size), offset, length)
+        if self._run_cache is None or self._run_cache[0] != entry.ref:  # streamed in 1 MiB steps: parse the extent tree once
+            self._run_cache = (entry.ref, self._extents(f, entry.deleted))
+        return self._read_runs(self._run_cache[1], min(f["size"], entry.size), offset, length)

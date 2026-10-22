@@ -5,12 +5,13 @@ anything that writes asks for the same typed confirmations the CLI does.
 """
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 import traceback
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -38,9 +39,10 @@ from .. import __version__
 from ..brand import NAME, TAGLINE
 from ..core import backup, boot, disks, doctor, imaging, license, safety
 from ..core import partitions as parts
+from ..core.cancel import CancelToken
 from ..core.device import BlockSource, PartitionView, open_source
 from ..core.fs import FsError, open_filesystem
-from ..core.recovery import filter_entries, preview, recover
+from ..core.recovery import Estimate, iter_entries, preview, recover
 from ..i18n import tr
 from . import icons, theme
 
@@ -68,6 +70,10 @@ class Page(QWidget):
         self.win = win
         self._threads: list[QThread] = []
         self._workers: list[Worker] = []
+        self.token = CancelToken()
+        self.cancel_btn = QPushButton(tr("Cancel"))
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self.token.cancel)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.status = QLabel("")
@@ -81,15 +87,18 @@ class Page(QWidget):
         t.started.connect(w.run)
 
         def on_progress(d: int, tot: int) -> None:
-            self.progress.setMaximum(max(tot, 1))
-            self.progress.setValue(d)
+            # permille, not raw bytes: QProgressBar holds a 32-bit int and a 5 TB disk is ~5e12 bytes
+            self.progress.setMaximum(1000)
+            self.progress.setValue(min(1000, int(1000 * d / tot)) if tot else 0)
 
         def finished_ok(result: object) -> None:
+            self.cancel_btn.setVisible(False)
             self.progress.setVisible(False)
             on_done(result)
             t.quit()
 
         def finished_bad(msg: str) -> None:
+            self.cancel_btn.setVisible(False)
             self.progress.setVisible(False)
             self.status.setText(msg)
             QMessageBox.warning(self, NAME, msg)
@@ -105,6 +114,8 @@ class Page(QWidget):
         t.finished.connect(cleanup)
         self._threads.append(t)
         self._workers.append(w)
+        self.token.reset()
+        self.cancel_btn.setVisible(True)
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.status.setText(label)
@@ -117,7 +128,11 @@ class Page(QWidget):
         back.setFixedWidth(110)
         t = QLabel(title)
         t.setObjectName("title")
-        lay.addWidget(back)
+        top = QHBoxLayout()
+        top.addWidget(back)
+        top.addStretch(1)
+        top.addWidget(self.cancel_btn)
+        lay.addLayout(top)
         lay.addWidget(t)
         if subtitle:
             s = QLabel(subtitle)
@@ -191,7 +206,12 @@ class RecoverPage(Page):
         self.carve_btn.clicked.connect(self.carve)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText(tr("Filter by name or type, e.g. jpg"))
-        self.filter.textChanged.connect(self.apply_filter)
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self.apply_filter)
+        self.filter.textChanged.connect(lambda _t: self._debounce.start())
+        self.include_live = QCheckBox(tr("Also list existing files (slower, more memory)"))
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels([tr("Name"), tr("Size"), tr("State"), tr("Chance"), tr("Path")])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -212,6 +232,7 @@ class RecoverPage(Page):
             lay.addWidget(w)
         lay.addLayout(row)
         lay.addLayout(btns)
+        lay.addWidget(self.include_live)
         lay.addWidget(self.filter)
         lay.addWidget(self.table, 1)
         pv = QHBoxLayout()
@@ -253,18 +274,30 @@ class RecoverPage(Page):
         except Exception as ex:  # noqa: BLE001
             QMessageBox.warning(self, NAME, str(ex))
 
+    MAX_ENTRIES = 2_000_000  # the list lives in memory; a 5 TB disk can hold more files than that
+
     def scan(self) -> None:
+        live = self.include_live.isChecked()
+
         def job(progress):
             vol = self._volume()
             fs = open_filesystem(vol)
-            return vol, fs, list(fs.scan(progress=progress))
-        self.run_bg(job, self.scanned, tr("Reading the file table..."))
+            out = list(itertools.islice(fs.scan(include_live=live, progress=progress, cancel=self.token), self.MAX_ENTRIES + 1))
+            return vol, fs, out
+        self.run_bg(job, self.scanned, tr("Reading the file table... (you can cancel; what was found so far is kept)"))
 
     def scanned(self, res) -> None:
         self.vol, self.fs, self.entries = res
+        capped = len(self.entries) > self.MAX_ENTRIES
+        if capped:
+            self.entries = self.entries[:self.MAX_ENTRIES]
         self.carved = []
-        deleted = sum(e.deleted for e in self.entries)
-        self.status.setText(tr("{n} files, {d} deleted.").format(n=len(self.entries), d=deleted))
+        est = Estimate()
+        for e in self.entries:
+            est.add(e)
+        note = (" " + tr("[stopped early: partial list]")) if self.token.cancelled else (" " + tr("[list capped; use the CLI for the rest]") if capped else "")
+        self.status.setText(tr("{n} files, {d} deleted: {g} look intact, {p} partly overwritten, {l} overwritten.").format(
+            n=est.files, d=est.deleted, g=est.good, p=est.partial, l=est.lost) + note)
         self.apply_filter()
 
     def carve(self) -> None:
@@ -272,32 +305,37 @@ class RecoverPage(Page):
 
         def job(progress):
             src = open_source(self.src.path)
-            return src, list(carver.carve(src, progress=progress))
-        self.run_bg(job, self.carved_done, tr("Scanning for file signatures..."))
+            found = list(itertools.islice(carver.carve(src, progress=progress, cancel=self.token), self.MAX_ENTRIES))
+            return src, found
+        self.run_bg(job, self.carved_done, tr("Scanning for file signatures... (cancel any time; found files are kept)"))
 
     def carved_done(self, res) -> None:
         self.vol, self.carved = res
         self.entries, self.fs = [], None
         self.table.setRowCount(0)
-        for c in self.carved:
+        for c in self.carved[:5000]:
             r = self.table.rowCount()
             self.table.insertRow(r)
             for i, v in enumerate([c.name, str(c.size), tr("carved"), "?", f"offset {c.offset}"]):
                 self.table.setItem(r, i, QTableWidgetItem(v))
-        self.status.setText(tr("{n} files found by signature.").format(n=len(self.carved)))
+        self.status.setText(tr("{n} files found by signature.").format(n=len(self.carved)) +
+                            ((" " + tr("[stopped early]")) if self.token.cancelled else ""))
 
     def apply_filter(self) -> None:
         if self.carved:
             return
-        shown = filter_entries(self.entries, name_contains=self.filter.text().strip())
+        # lazy + capped at 5000 rows: filtering millions of entries must never block the window
+        shown = list(itertools.islice(iter_entries(self.entries, name_contains=self.filter.text().strip()), 5000))
         self.shown = shown
+        self.table.setUpdatesEnabled(False)
         self.table.setRowCount(0)
-        for e in shown[:5000]:
+        for e in shown:
             r = self.table.rowCount()
             self.table.insertRow(r)
             chance = "-" if not e.deleted else (tr("lost") if e.overwritten_pct >= 100 else tr("good") if e.overwritten_pct == 0 else f"{100 - e.overwritten_pct:.0f}%")
             for i, v in enumerate([e.name, str(e.size), tr("deleted") if e.deleted else tr("present"), chance, e.path]):
                 self.table.setItem(r, i, QTableWidgetItem(v))
+        self.table.setUpdatesEnabled(True)
 
     def show_preview(self) -> None:
         rows = {i.row() for i in self.table.selectedItems()}
@@ -332,10 +370,23 @@ class RecoverPage(Page):
             if self.carved:
                 from ..core import carver
                 safety.check_output_location(self.vol, out)
-                return [carver.extract(self.vol, self.carved[r], out) for r in rows]
-            return recover(self.fs, [self.shown[r] for r in rows], out, source=self.vol, license=lic, progress=progress)
-        self.run_bg(job, lambda rep: self.status.setText(
-            tr("Recovered {n} file(s) to {p}").format(n=len(rep) if isinstance(rep, list) else rep.recovered, p=out)), tr("Recovering..."))
+                done = []
+                for r in rows:
+                    if self.token():
+                        break
+                    done.append(carver.extract(self.vol, self.carved[r], out))
+                return done
+            return recover(self.fs, [self.shown[r] for r in rows], out, source=self.vol, license=lic, cancel=self.token,
+                           byte_progress=progress)  # progress inside the current file, so a 2 TB file shows movement
+        def finished(rep) -> None:
+            n = len(rep) if isinstance(rep, list) else rep.recovered
+            extra = ""
+            if not isinstance(rep, list):
+                extra = (" " + tr("[cancelled]") if rep.cancelled else "") + (" " + rep.stopped_reason if rep.stopped_reason else "")
+                extra += (" " + tr("{f} failed.").format(f=rep.failed)) if rep.failed else ""
+            self.status.setText(tr("Recovered {n} file(s) to {p}").format(n=n, p=out) + extra)
+
+        self.run_bg(job, finished, tr("Recovering... (you can cancel; no half-written files are left)"))
 
 
 class DoctorPage(Page):
@@ -378,9 +429,9 @@ class DoctorPage(Page):
             QMessageBox.information(self, NAME, str(ex))
             return
 
-        def job(_p):
+        def job(progress):
             with open_source(self.src.path) as s:
-                return doctor.diagnose(s)
+                return doctor.diagnose(s, cancel=self.token, progress=progress)
         self.run_bg(job, self.show_findings, tr("Diagnosing..."))
 
     def show_findings(self, findings) -> None:
@@ -456,8 +507,9 @@ class ImagePage(Page):
 
         def job(progress):
             with open_source(self.src.path) as s:
-                return imaging.ImageJob(s, dest).run(progress)
-        self.run_bg(job, lambda r: self.status.setText(tr("Image {p}: complete={c}, bad bytes={b}").format(p=r.path, c=r.complete, b=r.bad_bytes)),
+                return imaging.ImageJob(s, dest, cancel_fn=self.token).run(progress)
+        self.run_bg(job, lambda r: self.status.setText(tr("Image {p}: complete={c}, bad bytes={b}").format(p=r.path, c=r.complete, b=r.bad_bytes) +
+                                       ((" " + tr("[stopped: press Create image again to resume]")) if r.cancelled else "")),
                     tr("Imaging..."))
 
 
@@ -498,15 +550,18 @@ class BackupPage(Page):
             return
         folder, dest, pw = self.folder.text().strip(), self.dest.text().strip(), self.pw.text() or None
 
-        def job(_p):
+        def job(progress):
             try:
                 repo = backup.Repository.open(dest, pw)
             except backup.BackupError:
                 repo = backup.Repository.init(dest, pw)
-            st = backup.backup(repo, [folder])
+            st = backup.backup(repo, [folder], cancel=self.token)
+            if st.cancelled:
+                return st, None
             return st, backup.verify_backup(repo, st.snapshot_id)
         self.run_bg(job, lambda r: self.status.setText(
-            tr("Backed up {n} files. Test restore: {v}").format(n=r[0].files, v=tr("OK") if r[1].ok else tr("FAILED"))), tr("Backing up..."))
+            tr("Backed up {n} files. Test restore: {v}").format(n=r[0].files, v=tr("OK") if r[1].ok else tr("FAILED"))
+            if r[1] else tr("Cancelled: no snapshot was written; run again to continue (stored data is reused).")), tr("Backing up..."))
 
 
 class BootPage(Page):

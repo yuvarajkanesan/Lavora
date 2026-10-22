@@ -23,17 +23,20 @@ from ..core import (
     report,
     safety,
     schedule,
+    session,
     smart,
     trash,
     undo,
 )
 from ..core import partitions as parts
 from ..core import rescue as rescue_mod
+from ..core.cancel import CancelToken, install_sigint
 from ..core.device import BlockSource, PartitionView, open_source
 from ..core.fs import FsError, open_filesystem
-from ..core.recovery import filter_entries, preview, recover
+from ..core.recovery import Estimate, iter_entries, preview, recover
 from ..i18n import tr
 
+TOKEN = CancelToken()  # Ctrl+C sets it; every long operation polls it
 BASIC_FIXES = {"restore-ntfs-boot", "restore-fat32-boot", "repair-gpt", "rebuild-mbr", "rebuild-gpt"}
 
 
@@ -108,7 +111,7 @@ def cmd_partitions(a: argparse.Namespace) -> int:
         found: list[dict[str, Any]] = []
         if a.scan:
             found = [{"start": f.start, "size": f.size, "fs": f.fs, "confidence": f.confidence, "note": f.note}
-                     for f in parts.scan_lost_partitions(src, progress=_progress("scanning"))]
+                     for f in parts.scan_lost_partitions(src, progress=_progress("scanning"), cancel=TOKEN)]
         text = [f"partition table: {scheme}"] + [f"  #{r['index']} {r['fs'] or '?':8} start {r['start']:>14} size {_fmt_size(r['size'])}"
                                                  for r in rows]
         if a.scan:
@@ -119,21 +122,44 @@ def cmd_partitions(a: argparse.Namespace) -> int:
 
 
 def _entries(a: argparse.Namespace, vol: BlockSource):
+    """(filesystem, lazy filtered entries). Nothing is held in memory: a 5 TB disk with millions of files streams through."""
     fs = open_filesystem(vol)
     exts = {e.strip(".").lower() for e in a.ext.split(",")} if a.ext else None
-    entries = list(fs.scan(include_live=not a.deleted_only, progress=_progress("reading file table")))
-    return fs, filter_entries(entries, exts=exts, min_size=a.min_size, name_contains=a.name or "",
-                              deleted_only=a.deleted_only,
-                              since=datetime.fromisoformat(a.since).astimezone() if a.since else None)
+    raw = fs.scan(include_live=not a.deleted_only, progress=_progress("reading file table"), cancel=TOKEN)
+    if getattr(a, "save", None):
+        writer = session.SessionWriter(a.save, a.source, vol.size if not isinstance(vol, PartitionView) else vol.parent.size,
+                                       vol.offset if isinstance(vol, PartitionView) else 0, vol.size, fs.name)
+        raw = writer.tee(raw, TOKEN)
+    return fs, iter_entries(raw, exts=exts, min_size=a.min_size, name_contains=a.name or "", deleted_only=a.deleted_only,
+                            since=datetime.fromisoformat(a.since).astimezone() if a.since else None)
 
 
 def cmd_scan(a: argparse.Namespace) -> int:
+    est = Estimate()
+    count = 0
     with open_volume(a.source, a.partition, a.offset) as vol:
         _fs, entries = _entries(a, vol)
-        rows = [e.to_dict() for e in entries]
-        lines = [f"{'DEL' if e.deleted else '   '} {e.size:>12}  {e.overwritten_pct:5.0f}%  {e.path}" for e in entries]
-        _out(a, rows, "\n".join(lines) + f"\n{len(entries)} file(s)")
-    return 0
+        if a.json:
+            print("[", end="")
+        for e in entries:
+            est.add(e)
+            count += 1
+            if a.limit and count > a.limit:
+                continue  # keep counting for the summary, stop printing
+            if a.json:
+                print(("," if count > 1 else "") + json.dumps(e.to_dict()), end="")
+            else:
+                print(f"{'DEL' if e.deleted else '   '} {e.size:>12}  {e.overwritten_pct:5.0f}%  {e.path}")
+        if a.json:
+            print("]")
+        else:
+            d = est.as_dict()
+            print(f"{count} file(s)" + (f", {a.limit} shown" if a.limit and count > a.limit else "") +
+                  f"; deleted {d['deleted']}: {d['good']} look intact, {d['partial']} partly overwritten, {d['lost']} overwritten, "
+                  f"{d['unsupported']} unsupported" + ("  [scan was stopped; the list is partial]" if TOKEN.cancelled else ""))
+            if a.save:
+                print(f"session saved to {a.save} (use: lavora-cli recover --session {a.save} ...)")
+    return 130 if TOKEN.cancelled else 0
 
 
 def cmd_preview(a: argparse.Namespace) -> int:
@@ -149,21 +175,37 @@ def cmd_preview(a: argparse.Namespace) -> int:
 
 def cmd_recover(a: argparse.Namespace) -> int:
     lic = license.current()
-    with open_volume(a.source, a.partition, a.offset) as vol:
+    if not (a.all or a.name or a.ext or a.ref):
+        raise CliError("nothing selected: use --all, --name, --ext or --ref")
+    if a.session:  # resume from a saved scan: no rescan
+        vol, fs, _h = session.reopen(a.session)
+        exts = {e.strip(".").lower() for e in a.ext.split(",")} if a.ext else None
+        entries = iter_entries(session.read_entries(a.session), exts=exts, min_size=a.min_size, name_contains=a.name or "",
+                               deleted_only=a.deleted_only)
+        ctx = vol
+    else:
+        ctx = open_volume(a.source, a.partition, a.offset)
+        vol = ctx
         fs, entries = _entries(a, vol)
+    with ctx:
         if a.ref:
-            entries = [e for e in entries if e.ref in a.ref]
-        elif not (a.all or a.name or a.ext):
-            raise CliError("nothing selected: use --all, --name, --ext or --ref")
-        rep = recover(fs, entries, a.out, source=vol, license=lic, dry_run=a.dry_run, progress=_progress("recovering"))
-        for f in rep.files:
-            print(("would write " if a.dry_run else "ok   " if f.ok else "FAIL ") + f.dest + (f"  {f.error}" if f.error else ""))
-        print(f"{rep.recovered} recovered, {rep.failed} failed" + (" (dry run, nothing written)" if a.dry_run else ""))
+            wanted = set(a.ref)
+            entries = (e for e in entries if e.ref in wanted)
+
+        def show(f) -> None:
+            if not f.ok or a.verbose or a.dry_run:
+                print(("would write " if a.dry_run else "FAIL ") + f.dest + (f"  {f.error}" if f.error else ""))
+
+        rep = recover(fs, entries, a.out, source=vol, license=lic, dry_run=a.dry_run, cancel=TOKEN, on_file=show,
+                      keep_results=bool(a.report), byte_progress=_progress("copying file"))
+        print(f"\n{rep.recovered} recovered ({_fmt_size(rep.bytes_written)}), {rep.failed} failed" +
+              (" (dry run, nothing written)" if a.dry_run else "") + ("  [cancelled]" if rep.cancelled else "") +
+              (f"  [{rep.stopped_reason}]" if rep.stopped_reason else ""))
         if a.report:
             report.save(report.build_report("Recovery report", {
                 "summary": {"recovered": rep.recovered, "failed": rep.failed, "source": a.source},
                 "files": [{"path": f.entry.path, "dest": f.dest, "sha256": f.sha256, "error": f.error} for f in rep.files]}), a.report)
-        return 1 if rep.failed else 0
+        return 130 if rep.cancelled else 1 if rep.failed or rep.stopped_reason else 0
 
 
 def cmd_carve(a: argparse.Namespace) -> int:
@@ -171,29 +213,38 @@ def cmd_carve(a: argparse.Namespace) -> int:
     with open_source(a.source) as src:
         want = {t.strip().lower() for t in a.types.split(",")} if a.types else None
         sigs = [s for s in carver.SIGNATURES if not want or s.ext in want]
-        found = list(carver.carve(src, signatures=sigs, progress=_progress("carving")))
-        total = sum(c.size for c in found)
-        if a.dry_run or not a.out:
-            for c in found:
-                print(f"{c.sig.name:10} offset {c.offset:>14}  size {c.size:>12}")
-            print(f"{len(found)} file(s) found" + ("" if a.out else " (pass --out to extract)"))
-            return 0
-        safety.check_output_location(src, a.out)
+        out = None if a.dry_run or not a.out else a.out
+        if out:
+            safety.check_output_location(src, out)
         limit = lic.recovery_limit()
-        if limit is not None and total > limit:
-            raise license.LicenseRequired("unlimited-recovery")
-        for c in found:
-            print(carver.extract(src, c, a.out))
-        print(f"{len(found)} file(s) carved to {a.out}")
+        total = count = 0
+        last = a.start
+        for c in carver.carve(src, signatures=sigs, progress=_progress("carving"), cancel=TOKEN, start=a.start):
+            last = c.offset + c.size
+            if out is None:
+                print(f"{c.sig.name:10} offset {c.offset:>14}  size {c.size:>12}")
+            else:
+                if limit is not None and total + c.size > limit:
+                    raise license.LicenseRequired("unlimited-recovery")
+                print(carver.extract(src, c, out))
+            total += c.size
+            count += 1
+        print(f"{count} file(s) {'carved to ' + out if out else 'found (pass --out to extract)'}")
+        if TOKEN.cancelled:
+            print(f"stopped; continue later with:  --start {last}")
+            return 130
     return 0
 
 
 def cmd_image(a: argparse.Namespace) -> int:
     license.current().require("imaging")
     with open_source(a.source) as src:
-        job = imaging.ImageJob(src, a.dest, passes=a.passes, compress=a.compress)
+        job = imaging.ImageJob(src, a.dest, passes=a.passes, compress=a.compress, hash_result=a.hash, cancel_fn=TOKEN)
         res = job.run(_progress("imaging"))
-        print(f"\nimage: {res.path}  complete={res.complete}  bad bytes={res.bad_bytes}  sha256={res.sha256 or 'n/a'}")
+        print(f"\nimage: {res.path}  complete={res.complete}  bad bytes={res.bad_bytes}  sha256={res.sha256 or 'not computed (use --hash)'}")
+        if res.cancelled:
+            print(f"stopped; run the same command again to resume (progress is in {job.mapfile})")
+            return 130
         if res.bad:
             print(f"bad-sector map: {job.mapfile}")
         return 0 if res.complete else 2
@@ -202,13 +253,37 @@ def cmd_image(a: argparse.Namespace) -> int:
 def cmd_clone(a: argparse.Namespace) -> int:
     license.current().require("imaging")
     with open_source(a.source) as src:
-        res = imaging.clone(src, a.target, confirmation=a.confirm, progress=_progress("cloning"))
+        res = imaging.clone(src, a.target, confirmation=a.confirm, progress=_progress("cloning"), cancel=TOKEN)
+        if res.cancelled:
+            print("\ncancelled; the target is incomplete")
+            return 130
         ok = True
         if a.verify:
             with open_source(a.target) as t:
                 ok = imaging.verify_copy(src, t, res.bad)
         print(f"\ncloned {_fmt_size(res.size)} to {a.target}; verify={'ok' if ok else 'MISMATCH'}")
         return 0 if ok and res.complete else 2
+
+
+def cmd_raid_detect(a: argparse.Namespace) -> int:
+    from ..core import raid
+    members = [open_source(m) for m in a.members]
+    try:
+        lv = tuple(int(x) for x in a.level.split(",")) if a.level else None
+        cands = raid.detect(members, levels=lv, chunk_sizes=tuple(int(c) * 1024 for c in a.chunks.split(",")) if a.chunks else raid.CHUNK_SIZES)
+        if not cands:
+            print("No RAID layout produced a recognisable partition table or filesystem. "
+                  "Check the members are all present and in one set; try --level, or fewer chunk sizes with --chunks.")
+            return 1
+        for i, c in enumerate(cands):
+            print(f"{i + 1}. {c.describe()}")
+        best = cands[0]
+        print("\nUse it as a source for any command:\n  " +
+              raid.spec_for(best.level, best.chunk, best.layout, [a.members[i] for i in best.order]))
+    finally:
+        for m in members:
+            m.close()
+    return 0
 
 
 def cmd_smart(a: argparse.Namespace) -> int:
@@ -220,7 +295,7 @@ def cmd_smart(a: argparse.Namespace) -> int:
 
 def cmd_surface(a: argparse.Namespace) -> int:
     with open_source(a.source) as src:
-        res = smart.surface_scan(src, progress=_progress("surface scan"), max_bytes=a.max_bytes)
+        res = smart.surface_scan(src, progress=_progress("surface scan"), max_bytes=a.max_bytes, cancel=TOKEN, start=a.start)
         print(f"\nscanned {_fmt_size(res.scanned)}; {len(res.bad)} unreadable block(s); {len(res.slow)} slow block(s)")
         return 0 if res.healthy else 1
 
@@ -438,6 +513,8 @@ def _filters(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-size", type=int, default=0)
     p.add_argument("--since", help="ISO date")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--save", help="save the scan to a session file as it runs (resume with recover --session)")
+    p.add_argument("--limit", type=int, default=0, help="print at most N entries (the summary still counts everything)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -465,6 +542,8 @@ def build_parser() -> argparse.ArgumentParser:
     _vol_args(p)
     _filters(p)
     p.add_argument("--out", required=True)
+    p.add_argument("--session", help="recover from a saved scan instead of scanning again")
+    p.add_argument("--verbose", action="store_true", help="print every recovered file")
     p.add_argument("--all", action="store_true")
     p.add_argument("--ref", type=int, nargs="*")
     p.add_argument("--dry-run", action="store_true")
@@ -473,23 +552,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("source")
     p.add_argument("--out")
     p.add_argument("--types", help="e.g. jpg,png,pdf,zip,mp4")
+    p.add_argument("--start", type=int, default=0, help="byte offset to start (resume a stopped carve)")
     p.add_argument("--dry-run", action="store_true")
     p = add("image", cmd_image, "image a disk with a bad-sector map (Pro)")
     p.add_argument("source")
     p.add_argument("dest")
     p.add_argument("--passes", type=int, default=3)
     p.add_argument("--compress", action="store_true")
+    p.add_argument("--hash", action="store_true", help="also compute SHA-256 (reads the whole disk once more)")
     p = add("clone", cmd_clone, "clone a disk/image onto another (Pro)")
     p.add_argument("source")
     p.add_argument("target")
     p.add_argument("--confirm", help='for a physical target: "ERASE <target>"')
     p.add_argument("--verify", action="store_true")
+    p = add("raid-detect", cmd_raid_detect, "find level/chunk/layout/order of a RAID from its member images or disks")
+    p.add_argument("members", nargs="+")
+    p.add_argument("--level", help="restrict to levels, e.g. 5 or 0,5")
+    p.add_argument("--chunks", help="chunk sizes in KiB to try, e.g. 64,128")
     p = add("smart", cmd_smart, "SMART health")
     p.add_argument("device")
     p.add_argument("--json", action="store_true")
     p = add("surface", cmd_surface, "read-only surface scan")
     p.add_argument("source")
     p.add_argument("--max-bytes", type=int)
+    p.add_argument("--start", type=int, default=0)
     for name, fn, h in (("doctor", cmd_doctor, "diagnose and fix (Pro)"), ("repair", cmd_repair, "basic boot-sector / partition-table repair")):
         p = add(name, fn, h)
         p.add_argument("source")
@@ -564,6 +650,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    TOKEN.reset()
+    if sys.stderr.isatty():
+        install_sigint(TOKEN)
     try:
         return args.fn(args)
     except (CliError, safety.SafetyError, license.LicenseRequired, FsError, backup.BackupError, ValueError) as ex:

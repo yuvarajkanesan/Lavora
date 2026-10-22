@@ -35,7 +35,7 @@ def disk():
 
 def test_clean_image_is_identical_and_hashed(tmp_path, disk):
     out = tmp_path / "a.img"
-    res = imaging.ImageJob(BytesSource(disk), str(out)).run()
+    res = imaging.ImageJob(BytesSource(disk), str(out), hash_result=True).run()
     assert res.complete and not res.bad and out.read_bytes() == disk
     assert res.sha256 == sha(disk)
 

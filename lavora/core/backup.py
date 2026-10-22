@@ -161,9 +161,11 @@ class BackupStats:
     bytes_total: int = 0
     bytes_stored: int = 0  # new blob bytes (before compression)
     errors: list[str] = field(default_factory=list)
+    cancelled: bool = False
 
 
-def backup(repo: Repository, sources: list[str], *, progress=None) -> BackupStats:
+def backup(repo: Repository, sources: list[str], *, progress=None, cancel=None) -> BackupStats:
+    """Back up `sources`. A cancelled run writes no snapshot (so it never looks complete); the chunks it stored are reused next time."""
     stats = BackupStats(snapshot_id=time.strftime("%Y%m%d-%H%M%S"))
     prev: dict[str, dict] = {}
     if repo.snapshots():
@@ -183,6 +185,9 @@ def backup(repo: Repository, sources: list[str], *, progress=None) -> BackupStat
                 dirs[:] = [d for d in dirs if os.path.abspath(os.path.join(root, d)) != repo_abs]
                 entries += [(os.path.join(root, n), os.path.relpath(os.path.join(root, n), base)) for n in names]
         for full, rel in entries:
+            if cancel and cancel():
+                stats.cancelled = True
+                return stats
             rel = rel.replace("\\", "/")
             try:
                 st = os.stat(full)
@@ -197,6 +202,9 @@ def backup(repo: Repository, sources: list[str], *, progress=None) -> BackupStat
                 h, chunks = hashlib.sha256(), []
                 with open(full, "rb") as f:
                     while block := f.read(CHUNK):
+                        if cancel and cancel():
+                            stats.cancelled = True
+                            return stats
                         h.update(block)
                         bid, new = repo.put_chunk(block)
                         chunks.append(bid)

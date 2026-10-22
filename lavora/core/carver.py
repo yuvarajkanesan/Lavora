@@ -8,7 +8,7 @@ import struct
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .device import BlockSource
+from .device import SECTOR, BlockSource
 
 
 @dataclass(frozen=True)
@@ -152,13 +152,13 @@ def _validate_header(sig: Signature, data: bytes, i: int) -> bool:
 
 
 def carve(source: BlockSource, *, signatures: list[Signature] | None = None, chunk: int = 4 * 1024 * 1024,
-          progress=None, cancel: Callable[[], bool] | None = None) -> Iterator[CarvedFile]:
+          progress=None, cancel: Callable[[], bool] | None = None, start: int = 0) -> Iterator[CarvedFile]:
     """Yield carved files in offset order. Header hits are found with fast byte search; sizes come from the format
     (exact size, footer search, or max size as a last resort)."""
     sigs = signatures or SIGNATURES
-    pos = 0
+    pos = start - start % SECTOR  # resume point: a cancelled carve of a huge disk continues here
     overlap = 64
-    last_end = 0
+    last_end = pos
     while pos < source.size:
         if cancel and cancel():
             return

@@ -6,8 +6,9 @@ reports how many of those clusters are allocated to another file now.
 """
 from __future__ import annotations
 
+import bisect
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from ..device import BlockSource
 from .base import FileEntry, Filesystem, FsError, dos_to_dt
@@ -18,6 +19,79 @@ def _lfn_checksum(short: bytes) -> int:
     for b in short:
         s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
     return s
+
+
+class ChainMap:
+    """A FAT cluster chain stored as runs and walked lazily, so a 2 TB file costs memory for its fragments, not its clusters."""
+
+    def __init__(self, first: int, nxt, valid, eoc: int):
+        self.nxt, self.valid, self.eoc = nxt, valid, eoc
+        self.runs: list[list[int]] = [[first, 1]]  # [first cluster, count]
+        self.cum = [0]  # logical index where each run starts
+        self.total = 1
+        self.last = first
+        self.done = not valid(first)
+        self._steps = 0
+
+    def _step(self) -> bool:
+        n = self.nxt(self.last)
+        if n >= self.eoc or not self.valid(n) or self._steps > 4_000_000_000:
+            self.done = True
+            return False
+        run = self.runs[-1]
+        if n == run[0] + run[1]:
+            run[1] += 1
+        else:
+            self.cum.append(self.total)
+            self.runs.append([n, 1])
+        self.total += 1
+        self.last = n
+        self._steps += 1
+        return True
+
+    def locate(self, idx: int, want: int = 256) -> tuple[int, int] | None:
+        """(cluster, contiguous clusters available from there) for logical cluster `idx`, or None past the end."""
+        while not self.done and self.total <= idx + 1:
+            self._step()
+        if idx >= self.total:
+            return None
+        while True:
+            i = bisect.bisect_right(self.cum, idx) - 1
+            first, count = self.runs[i]
+            left = count - (idx - self.cum[i])
+            if left >= want or self.done or i != len(self.runs) - 1:
+                return first + (idx - self.cum[i]), left
+            if not self._step():
+                return first + (idx - self.cum[i]), left
+
+
+def _sampled_used(first: int, n: int, used, limit: int = 4096) -> float:
+    """Percentage of the n clusters from `first` that are in use now: exact for small files, a 4096-point sample for huge ones."""
+    idxs = range(n) if n <= limit else (int(i * (n / limit)) for i in range(limit))
+    total = hit = 0
+    for i in idxs:
+        total += 1
+        hit += bool(used(first + i))
+    return 100.0 * hit / total if total else 0.0
+
+
+def _read_span(source, chain: ChainMap, coff, cluster: int, offset: int, length: int) -> bytes:
+    """Read [offset, offset+length) of a chained file with one read per contiguous run instead of one per cluster."""
+    out = bytearray()
+    pos = offset
+    while len(out) < length:
+        idx, inner = divmod(pos, cluster)
+        loc = chain.locate(idx)
+        if loc is None:
+            break
+        c, left = loc
+        take = min(left * cluster - inner, length - len(out))
+        data = source.read_at(coff(c) + inner, take)
+        out += data
+        pos += take
+        if len(data) < take:
+            break
+    return bytes(out)
 
 
 def _lfn_matches(short: bytes, checksum: int, deleted: bool) -> bool:
@@ -58,6 +132,8 @@ class FatFilesystem(Filesystem):
         self.root_cluster = struct.unpack_from("<I", b, 44)[0] if self.kind == "fat32" else 0
         self._fat_pages: dict[int, bytes] = {}
         self._chains: dict[int, list[int]] = {}
+        self._chain_maps: dict[int, ChainMap] = {}
+        self._cancel: Callable[[], bool] | None = None
 
     # ---------------------------------------------------------------- FAT access
     def _fat_bytes(self, off: int, n: int) -> bytes:
@@ -115,6 +191,8 @@ class FatFilesystem(Filesystem):
         raw = self._dir_bytes(cluster, deleted_dir)
         lfn: list[tuple[int, str]] = []
         for i in range(0, len(raw) - 31, 32):
+            if self._cancel and i % 8192 == 0 and self._cancel():
+                return
             e = raw[i:i + 32]
             if e[0] == 0:
                 break
@@ -143,8 +221,7 @@ class FatFilesystem(Filesystem):
                            ref=first, fs=self.kind)
             if not is_dir and deleted and size and first >= 2:
                 n = (size + self.cluster - 1) // self.cluster
-                used = sum(1 for c in range(first, first + n) if c < self.clusters + 2 and self.fat_entry(c) != 0)
-                fe.overwritten_pct = 100.0 * used / n
+                fe.overwritten_pct = _sampled_used(first, n, lambda c: c < self.clusters + 2 and self.fat_entry(c) != 0)
                 if first + n > self.clusters + 2:
                     fe.note = "unsupported: start cluster outside the volume"
             if include_live or deleted:
@@ -171,23 +248,22 @@ class FatFilesystem(Filesystem):
             x = x.lower()
         return f"{b}.{x}" if x else b
 
-    def scan(self, *, include_live: bool = True, progress=None) -> Iterator[FileEntry]:
+    def scan(self, *, include_live: bool = True, progress=None, cancel: Callable[[], bool] | None = None) -> Iterator[FileEntry]:
+        self._cancel = cancel
         yield from self._walk(self.root_cluster, "", False, set(), include_live)
 
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         length = entry.size - offset if length is None else min(length, entry.size - offset)
         if length <= 0 or entry.ref < 2:
             return b""
-        n_clusters = (entry.size + self.cluster - 1) // self.cluster
-        clusters = list(range(entry.ref, entry.ref + n_clusters)) if entry.deleted else self.chain(entry.ref)
-        out = bytearray()
-        pos = offset
-        while len(out) < length and pos // self.cluster < len(clusters):
-            idx, inner = divmod(pos, self.cluster)
-            take = min(self.cluster - inner, length - len(out))
-            out += self.source.read_at(self._cluster_off(clusters[idx]) + inner, take)
-            pos += take
-        return bytes(out)
+        if entry.deleted:  # chain was freed: assume one contiguous run (a single read, however large)
+            return self.source.read_at(self._cluster_off(entry.ref) + offset, length)
+        cm = self._chain_maps.get(entry.ref)
+        if cm is None:
+            if len(self._chain_maps) > 64:
+                self._chain_maps.clear()
+            cm = self._chain_maps[entry.ref] = ChainMap(entry.ref, self.fat_entry, lambda c: 2 <= c < self.clusters + 2, self.eoc)
+        return _read_span(self.source, cm, self._cluster_off, self.cluster, offset, length)
 
 
 class ExfatFilesystem(Filesystem):
@@ -203,6 +279,8 @@ class ExfatFilesystem(Filesystem):
         self.bps = 1 << b[108]
         self.cluster = self.bps << b[109]
         self._bitmap: bytes | None = None
+        self._chain_maps: dict[int, ChainMap] = {}
+        self._cancel: Callable[[], bool] | None = None
 
     def _coff(self, n: int) -> int:
         return self.heap_off * self.bps + (n - 2) * self.cluster
@@ -244,6 +322,8 @@ class ExfatFilesystem(Filesystem):
         raw = self._dir(first, contiguous, size)
         i = 0
         while i + 32 <= len(raw):
+            if self._cancel and i % 8192 == 0 and self._cancel():
+                return
             t = raw[i]
             if t == 0:
                 break
@@ -272,7 +352,7 @@ class ExfatFilesystem(Filesystem):
                                ref=fcluster, fs="exfat", extra={"contiguous": nofat or deleted})
                 if deleted and not is_dir and fsize and fcluster >= 2:
                     n = (fsize + self.cluster - 1) // self.cluster
-                    fe.overwritten_pct = 100.0 * sum(self._bit(c) for c in range(fcluster, fcluster + n)) / n
+                    fe.overwritten_pct = _sampled_used(fcluster, n, self._bit)
                 if include_live or deleted:
                     yield fe
                 if is_dir:
@@ -281,19 +361,19 @@ class ExfatFilesystem(Filesystem):
             else:
                 i += 32
 
-    def scan(self, *, include_live: bool = True, progress=None) -> Iterator[FileEntry]:
+    def scan(self, *, include_live: bool = True, progress=None, cancel: Callable[[], bool] | None = None) -> Iterator[FileEntry]:
+        self._cancel = cancel
         yield from self._walk(self.root, False, 0, "", include_live, set())
 
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         length = entry.size - offset if length is None else min(length, entry.size - offset)
         if length <= 0 or entry.ref < 2:
             return b""
-        clusters = self._chain(entry.ref, entry.extra.get("contiguous", False), entry.size)
-        out = bytearray()
-        pos = offset
-        while len(out) < length and pos // self.cluster < len(clusters):
-            idx, inner = divmod(pos, self.cluster)
-            take = min(self.cluster - inner, length - len(out))
-            out += self.source.read_at(self._coff(clusters[idx]) + inner, take)
-            pos += take
-        return bytes(out)
+        if entry.extra.get("contiguous", False):
+            return self.source.read_at(self._coff(entry.ref) + offset, length)
+        cm = self._chain_maps.get(entry.ref)
+        if cm is None:
+            if len(self._chain_maps) > 64:
+                self._chain_maps.clear()
+            cm = self._chain_maps[entry.ref] = ChainMap(entry.ref, self._fat, lambda c: 2 <= c < self.clusters + 2, 0xFFFFFFF8)
+        return _read_span(self.source, cm, self._coff, self.cluster, offset, length)

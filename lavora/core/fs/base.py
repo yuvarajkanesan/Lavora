@@ -18,7 +18,7 @@ class FsError(Exception):
     """The filesystem structures are damaged or not what we expected."""
 
 
-@dataclass
+@dataclass(slots=True)
 class FileEntry:
     path: str  # forward-slash path from the volume root
     name: str
@@ -42,9 +42,19 @@ class FileEntry:
         return not self.is_dir and not self.note.startswith("unsupported") and self.overwritten_pct < 100.0
 
     def to_dict(self) -> dict:
-        return {"path": self.path, "size": self.size, "deleted": self.deleted, "is_dir": self.is_dir,
-                "mtime": self.mtime.isoformat() if self.mtime else None, "fs": self.fs, "ref": self.ref,
-                "overwritten_pct": round(self.overwritten_pct, 1), "note": self.note}
+        return {"path": self.path, "name": self.name, "size": self.size, "deleted": self.deleted, "is_dir": self.is_dir,
+                "mtime": self.mtime.isoformat() if self.mtime else None, "ctime": self.ctime.isoformat() if self.ctime else None,
+                "fs": self.fs, "ref": self.ref, "overwritten_pct": round(self.overwritten_pct, 1), "note": self.note,
+                "extra": self.extra}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> FileEntry:
+        def dt(v):
+            return datetime.fromisoformat(v) if v else None
+        return cls(path=d["path"], name=d.get("name") or d["path"].rsplit("/", 1)[-1], size=d["size"], is_dir=d.get("is_dir", False),
+                   deleted=d.get("deleted", False), mtime=dt(d.get("mtime")), ctime=dt(d.get("ctime")), ref=d.get("ref", 0),
+                   fs=d.get("fs", ""), overwritten_pct=d.get("overwritten_pct", 0.0), note=d.get("note", ""),
+                   extra=d.get("extra") or {})
 
 
 class Filesystem(ABC):
@@ -54,8 +64,8 @@ class Filesystem(ABC):
         self.source = source
 
     @abstractmethod
-    def scan(self, *, include_live: bool = True, progress=None) -> Iterator[FileEntry]:
-        """Yield files and directories (deleted ones flagged)."""
+    def scan(self, *, include_live: bool = True, progress=None, cancel=None) -> Iterator[FileEntry]:
+        """Yield files and directories (deleted ones flagged). `cancel()` returning True stops the scan promptly."""
 
     @abstractmethod
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:

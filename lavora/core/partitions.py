@@ -269,14 +269,16 @@ def _valid_boot(source: BlockSource, off: int, fs: str) -> FoundPartition | None
 
 
 def scan_lost_partitions(source: BlockSource, *, max_bytes: int | None = None, chunk: int = 4 * 1024 * 1024,
-                         progress=None) -> list[FoundPartition]:
+                         progress=None, cancel=None, start: int = 0) -> list[FoundPartition]:
     """Scan for NTFS / FAT32 / exFAT / ext boot structures anywhere on the source (sector-aligned)."""
     limit = min(source.size, max_bytes or source.size)
     patterns = {b"NTFS    ": ("ntfs", 3), b"EXFAT   ": ("exfat", 3), b"FAT32   ": ("fat32", 82)}
     hits: dict[int, FoundPartition] = {}
-    pos = 0
+    pos = start - start % SECTOR
     overlap = 2048
     while pos < limit:
+        if cancel and cancel():
+            break
         data = source.read_at(pos, chunk + overlap)
         if not data:
             break

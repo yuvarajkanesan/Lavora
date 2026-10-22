@@ -95,12 +95,14 @@ class SurfaceResult:
 
 
 def surface_scan(source: BlockSource, *, block: int = 1 << 20, slow_after: float = 0.5, progress=None,
-                 max_bytes: int | None = None) -> SurfaceResult:
+                 max_bytes: int | None = None, cancel=None, start: int = 0) -> SurfaceResult:
     """Read the whole source once, recording unreadable blocks and unusually slow ones. Read-only."""
     res = SurfaceResult()
     limit = min(source.size, max_bytes or source.size)
-    pos = 0
+    pos = start
     while pos < limit:
+        if cancel and cancel():
+            break
         n = min(block, limit - pos)
         t = time.perf_counter()
         try:

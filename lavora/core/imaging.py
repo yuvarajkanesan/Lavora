@@ -49,13 +49,14 @@ class ImageResult:
 
 class ImageJob:
     def __init__(self, source: BlockSource, dest: str, *, block: int = 1 << 20, passes: int = 3,
-                 mapfile: str | None = None, compress: bool = False, hash_result: bool = True):
+                 mapfile: str | None = None, compress: bool = False, hash_result: bool = False, cancel_fn=None):
         if block % SECTOR:
             raise ValueError("block size must be a multiple of 512")
         if os.path.exists(dest) and not mapfile and os.path.getsize(dest) and not os.path.exists(dest + ".map"):
             raise SafetyError(f"{dest} already exists; refusing to overwrite an existing image.")
         self.source, self.dest = source, dest
         self.block, self.passes, self.compress, self.hash_result = block, passes, compress, hash_result
+        self.cancel_fn = cancel_fn
         self.mapfile = mapfile or dest + ".map"
         self._run = threading.Event()
         self._run.set()
@@ -92,7 +93,7 @@ class ImageJob:
     def _checkpoint(self) -> bool:
         """Honour pause/cancel; True means stop."""
         self._run.wait()
-        return self._cancel
+        return self._cancel or bool(self.cancel_fn and self.cancel_fn())
 
     # ---------------------------------------------------------------- the copy
     def run(self, progress: Callable[[int, int], None] | None = None) -> ImageResult:
@@ -206,11 +207,16 @@ class ImageJob:
 
 
 # ---------------------------------------------------------------- hashing / cloning
-def sha256_of(source: BlockSource, skip: list[Range] | None = None, chunk: int = 1 << 20) -> str:
+def sha256_of(source: BlockSource, skip: list[Range] | None = None, chunk: int = 1 << 20, cancel=None, progress=None) -> str:
+    """SHA-256 of the whole source (a full read: optional for huge disks). Returns '' if cancelled."""
     h = hashlib.sha256()
     pos = 0
     skip = merge_ranges(skip or [])
     while pos < source.size:
+        if cancel and cancel():
+            return ""
+        if progress:
+            progress(pos, source.size)
         n = min(chunk, source.size - pos)
         for so, sl in skip:  # bad ranges are hashed as zeros on both sides
             if so < pos + n and so + sl > pos:
@@ -232,7 +238,7 @@ def verify_copy(source: BlockSource, copy: BlockSource, skip: list[Range] | None
 
 
 def clone(source: BlockSource, target: str, *, confirmation: str | None = None, block: int = 1 << 20,
-          progress=None) -> ImageResult:
+          progress=None, cancel=None) -> ImageResult:
     """Copy `source` onto `target` (a device or file). Writing to a physical disk needs the typed phrase
     'ERASE <target>'; the target must never be the source and must be at least as large."""
     if os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(source.path)):
@@ -246,6 +252,8 @@ def clone(source: BlockSource, target: str, *, confirmation: str | None = None, 
     with open(target, "r+b" if os.path.exists(target) else "w+b", buffering=0 if is_device else -1) as out:
         pos = 0
         while pos < source.size:
+            if cancel and cancel():
+                return ImageResult(target, source.size, merge_ranges(bad), False, True, passes_done=1)
             n = min(block, source.size - pos)
             try:
                 data = source.read_exact(pos, n)

@@ -150,6 +150,9 @@ def _device_size(fh: BinaryIO, path: str) -> int:
 def open_source(path: str) -> BlockSource:
     """Open a path as a read-only source: devices by name, everything else as an image file."""
     low = path.lower()
+    if low.startswith("raid:"):  # a virtual RAID described by a spec string (see lavora.core.raid)
+        from .raid import open_raid_spec
+        return open_raid_spec(path)
     if low.startswith("\\\\.\\physicaldrive") or low.startswith("/dev/"):
         return DeviceSource(path)
     return ImageSource(path)

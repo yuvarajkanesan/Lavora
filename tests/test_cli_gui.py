@@ -193,4 +193,5 @@ def test_gui_recover_flow_scans_an_image(monkeypatch, tmp_path, disk_path):
     assert any(e.deleted and e.name == "holiday.jpg" for e in page.entries)
     assert page.table.rowCount() == len(page.shown)
     page.filter.setText("holiday")
+    page.apply_filter()  # the real UI debounces typing by 300 ms
     assert page.table.rowCount() == 1
