@@ -103,7 +103,7 @@ class ActionCard(QFrame):
         self.setObjectName("actionCard")
         self.setProperty("primary", primary)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(118)
+        self.setMinimumHeight(104)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(26, 22, 24, 22)
@@ -160,7 +160,7 @@ class ChoiceCard(QFrame):
         self._selected = False
         self.group: list[ChoiceCard] = []
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setContentsMargins(16, 11, 16, 11)
         lay.setSpacing(14)
         self.dot = _RadioDot(self._c["accent"], self._c["border_strong"])
         text = QVBoxLayout()

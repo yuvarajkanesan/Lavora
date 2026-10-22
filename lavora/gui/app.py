@@ -222,7 +222,46 @@ def build_window(app: QApplication) -> MainWindow:
     return MainWindow(name)
 
 
+# Height (in layout pixels, incl. the top bar) that the tallest page needs to show without scrolling. Measured with
+# tests/ heights probe; the UI is scaled so this always fits the work area of the screen it opens on.
+DESIGN_HEIGHT = 1090
+TITLE_BAR = 32
+
+
+def work_area_logical_height() -> int | None:
+    """Usable screen height in logical (96-dpi) pixels on Windows: work area (screen minus taskbar) divided by the DPI scale."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor; the same mode Qt uses, so numbers are physical pixels
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):  # SPI_GETWORKAREA
+            return None
+        dpi = ctypes.windll.user32.GetDpiForSystem() or 96
+        return int((rect.bottom - rect.top) * 96 / dpi)
+    except (OSError, AttributeError):
+        return None
+
+
+def ui_scale() -> float:
+    """Factor (<1 shrinks, >1 enlarges) that makes DESIGN_HEIGHT fit the screen. LAVORA_UI_SCALE overrides it (1 = off)."""
+    override = os.environ.get("LAVORA_UI_SCALE")
+    if override:
+        try:
+            return max(0.4, min(2.0, float(override)))
+        except ValueError:
+            pass
+    h = work_area_logical_height()
+    if not h:
+        return 1.0
+    return max(0.55, min(1.25, (h - TITLE_BAR) / DESIGN_HEIGHT))
+
+
 def run() -> int:
+    if "QT_SCALE_FACTOR" not in os.environ:  # must be set before the QApplication exists
+        os.environ["QT_SCALE_FACTOR"] = f"{ui_scale():.3f}"
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(NAME)
     win = build_window(app)  # type: ignore[arg-type]

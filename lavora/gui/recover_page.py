@@ -98,14 +98,13 @@ class RecoverPage(Page):
         cols.setSpacing(24)
         cols.addWidget(self._build_left(), 0, Qt.AlignmentFlag.AlignTop)
         cols.addLayout(self._build_right(), 1)
-        self.body_lay.addLayout(cols)
-        self.body_lay.addStretch(1)
+        self.body_lay.addLayout(cols, 1)  # the columns fill the page height; the results table takes the spare room
         self._update_selection()
         self._update_empty()
 
     # ---------------------------------------------------------------- left column
     def _build_left(self) -> QWidget:
-        card = Card((28, 26, 28, 24), 12)
+        card = Card((26, 20, 26, 18), 9)
         card.setFixedWidth(462)
         self.left = QStackedWidget()
         card.lay.addWidget(self.left)
@@ -113,7 +112,7 @@ class RecoverPage(Page):
         form = QWidget()
         f = QVBoxLayout(form)
         f.setContentsMargins(0, 0, 0, 0)
-        f.setSpacing(12)
+        f.setSpacing(8)
         f.addWidget(self._label(tr("Disk or image")))
         self.src = SourceRow()
         f.addWidget(self.src)
@@ -256,14 +255,14 @@ class RecoverPage(Page):
         for i, w in enumerate((60, 235, 100, 175, 225, 200)):
             self.table.setColumnWidth(i, w)
         self.table.setItemDelegateForColumn(4, ChanceDelegate(self.theme))
-        self.table.setMinimumHeight(430)
+        self.table.setMinimumHeight(230)  # the table takes whatever height is left, so the page fits any screen
         self.table.itemChanged.connect(lambda _i: self._update_selection())
         self.table.itemSelectionChanged.connect(self.show_preview)
         self.empty = self._empty_state()
         self.empty.setParent(self.table.viewport())
         self.table.viewport().installEventFilter(self)
         results.lay.addWidget(self.table)
-        col.addWidget(results)
+        col.addWidget(results, 1)
 
         # preview
         self.preview_card = Card((28, 24, 28, 24), 0)
@@ -364,8 +363,8 @@ class RecoverPage(Page):
         lay = QVBoxLayout(w)
         lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tile = QLabel()
-        tile.setPixmap(icons.tile_pixmap("search", self.c["accent"], 72, soft=self.c["accent_soft"]))
-        tile.setFixedSize(72, 72)
+        tile.setPixmap(icons.tile_pixmap("search", self.c["accent"], 60, soft=self.c["accent_soft"]))
+        tile.setFixedSize(60, 60)
         t = QLabel(tr("No scan yet"))
         t.setObjectName("h3")
         t.setStyleSheet("font-size: 21px; font-weight: 700;")
@@ -373,7 +372,7 @@ class RecoverPage(Page):
         s.setObjectName("lead")
         s.setStyleSheet("font-size: 17px;")
         s.setWordWrap(True)
-        s.setMaximumWidth(460)
+        s.setMaximumWidth(640)
         s.setAlignment(Qt.AlignmentFlag.AlignCenter)
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(tile, 0, Qt.AlignmentFlag.AlignHCenter)

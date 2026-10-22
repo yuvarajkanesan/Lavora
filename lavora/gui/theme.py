@@ -41,9 +41,9 @@ QLabel#pill {{ background: {c['accent_soft']}; color: {c['accent']}; border-radi
 QLabel#pillOk {{ background: {c['ok_soft']}; color: {c['ok']}; border-radius: 15px; padding: 7px 16px; font-weight: 600; font-size: 14px; }}
 
 /* headings */
-QLabel#hero {{ font-size: 46px; font-weight: 800; }}
-QLabel#title {{ font-size: 38px; font-weight: 800; }}
-QLabel#lead {{ color: {c['muted']}; font-size: 18px; }}
+QLabel#hero {{ font-size: 42px; font-weight: 800; }}
+QLabel#title {{ font-size: 34px; font-weight: 800; }}
+QLabel#lead {{ color: {c['muted']}; font-size: 17px; }}
 QLabel#sectionLabel {{ color: {c['muted']}; font-size: 13px; font-weight: 700; letter-spacing: 2px; }}
 QLabel#muted {{ color: {c['muted']}; }}
 QLabel#faint {{ color: {c['faint']}; }}

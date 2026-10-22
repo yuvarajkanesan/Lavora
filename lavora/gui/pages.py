@@ -226,9 +226,9 @@ class DoctorPage(Page):
         _style_table(self.table, (70, 170, 560, 400))
         self.table.setItemDelegateForColumn(0, RadioDelegate(self.theme))
         self.table.setItemDelegateForColumn(1, BadgeDelegate(self.theme))
-        self.table.setMinimumHeight(250)
+        self.table.setMinimumHeight(150)
         res.lay.addWidget(self.table)
-        self.body_lay.addWidget(res)
+        self.body_lay.addWidget(res, 1)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(24)
@@ -259,7 +259,6 @@ class DoctorPage(Page):
         bottom.addWidget(logc, 3, Qt.AlignmentFlag.AlignTop)
         self.body_lay.addLayout(bottom)
         self.body_lay.addWidget(self.status)
-        self.body_lay.addStretch(1)
         self.rows: list = []
         self.last_undo: str | None = None
 
@@ -603,7 +602,7 @@ class RaidPage(Page):
         self.members = QPlainTextEdit()
         self.members.setPlaceholderText(tr("One member per line: image file or \\\\.\\PhysicalDriveN"))
         self.members.setStyleSheet("font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace; font-size: 14px;")
-        self.members.setMinimumHeight(260)
+        self.members.setMinimumHeight(150)
         self.members.textChanged.connect(lambda: self.stepper.set_step(1) if not self.cands else None)
         left.lay.addWidget(self.members)
         add = QPushButton(tr("Add images..."))
@@ -644,10 +643,10 @@ class RaidPage(Page):
         _style_table(self.table, (64, 110, 100, 175, 110, 200))
         self.table.setItemDelegateForColumn(0, RadioDelegate(self.theme))
         self.table.setItemDelegateForColumn(5, ChanceDelegate(self.theme))
-        self.table.setMinimumHeight(260)
+        self.table.setMinimumHeight(150)
         self.table.itemSelectionChanged.connect(self._selected)
         res.lay.addWidget(self.table)
-        right.addWidget(res)
+        right.addWidget(res, 1)
         sel = Card((32, 26, 32, 26), 8)
         sel.lay.addWidget(_h3(tr("Selected result")))
         self.sel_text = QLabel(tr("Nothing detected yet."))
@@ -671,8 +670,7 @@ class RaidPage(Page):
         right.addWidget(bar)
         right.addWidget(self.status)
         cols.addLayout(right, 1)
-        self.body_lay.addLayout(cols)
-        self.body_lay.addStretch(1)
+        self.body_lay.addLayout(cols, 1)
         self.cands: list = []
         self.paths: list[str] = []
 

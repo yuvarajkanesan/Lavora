@@ -31,7 +31,7 @@ from .widgets import Card, palette
 if TYPE_CHECKING:
     from .app import MainWindow
 
-CONTENT_MAX_WIDTH = 1240
+CONTENT_MAX_WIDTH = 1760
 
 
 class Worker(QObject):
@@ -81,12 +81,12 @@ class Page(QWidget):
         host = QWidget()
         host.setObjectName("pageBody")
         row = QHBoxLayout(host)
-        row.setContentsMargins(40, 30, 40, 44)
+        row.setContentsMargins(56, 20, 56, 20)
         self.body = QWidget()
         self.body.setMaximumWidth(CONTENT_MAX_WIDTH)
         self.body_lay = QVBoxLayout(self.body)
         self.body_lay.setContentsMargins(0, 0, 0, 0)
-        self.body_lay.setSpacing(16)
+        self.body_lay.setSpacing(14)
         row.addStretch(1)
         row.addWidget(self.body, 100)
         row.addStretch(1)
@@ -99,7 +99,7 @@ class Page(QWidget):
         width = min(self.body.width() or CONTENT_MAX_WIDTH, CONTENT_MAX_WIDTH)
         need = self.body_lay.totalHeightForWidth(width)
         if need > 0:
-            self._host.setMinimumHeight(need + m.top() + m.bottom() + 8)
+            self._host.setMinimumHeight(need + m.top() + m.bottom())
 
     def resizeEvent(self, e) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(e)
