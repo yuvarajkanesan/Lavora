@@ -14,6 +14,9 @@ by SHA-256.
 | Imaging | bad-sector map, retry passes, cancel/resume, pause, gzip, clone + verify, VHD footer |
 | Backup | incremental, AES-256-GCM, wrong password, tamper + missing-blob detection, traversal-safe restore |
 | Safety / licence / accounts | output-volume refusal (fail closed), typed confirmations, Ed25519 licence, attestation + audit log |
+| Scale | 5 TiB synthetic disk: GPT, partition scan, carve-from-offset, cancel latency, 2 TB-file recovery cancel, ENOSPC stop, 200k-fragment reads, popcount estimates, session resume |
+| RAID | all layouts bit-exact, degraded reads (RAID 5: any 1 of 4; RAID 6: any 1-2 of 6), detection on shuffled members |
+| Virtual disks / editor | VHD, VHDX, VMDK, VDI round trips; deleted-file recovery through each; find across chunk boundaries; undoable sector write |
 | CLI / GUI | end-to-end commands on images; headless GUI builds and scans an image |
 
 **Limit of the automated tests:** the image builders and the parsers were written by the same author from the same reading of
@@ -37,4 +40,6 @@ Use Hyper-V / VirtualBox / QEMU with a throw-away VHDX. Record result + Lavora v
 | M11 | BitLocker volume | encrypt VHDX | Lavora cannot read it without unlocking; no bypass path exists |
 | M12 | Backup scheduling | `schedule --install` in a VM | task runs; verification OK |
 | M13 | Installer | install, launch (UAC), uninstall; upgrade 0.1.0 -> 0.1.1; downgrade refusal | clean install/uninstall, PATH entry added/removed, data kept on request |
+| M15 | Real 5 TB disk | image + scan a real large disk (or a sparse VHDX on a big drive) | no hang; Ctrl+C / Cancel stops within a few seconds; resume works. Note the real speed |
+| M16 | Real RAID | 3-4 member Linux md RAID5 / Windows Storage Spaces (not supported) | `raid-detect` finds the md geometry |
 | M14 | Rescue USB | write ISO to a USB passthrough in a VM | boots, GUI starts (needs the ISO, Phase 3) |

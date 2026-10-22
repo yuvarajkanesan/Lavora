@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 - unreleased
+### Added
+- Handles multi-terabyte disks without hanging: streaming scans, cancel everywhere, resume points, bounded memory (see ROADMAP).
+- Virtual RAID 0/1/5/6/10 with degraded reads and parameter auto-detection; `raid-detect`; GUI RAID builder.
+- Virtual disk containers: dynamic VHD, VHDX, VMDK, VDI.
+- Saved scan sessions, recovery-chance summary, `hex` / `find` / `sector-write`, GUI Disk editor, tile icons.
+### Changed
+- Imaging no longer re-reads the whole disk to hash it unless `--hash` is given.
+- `recover` and scans stream; `--save`, `--limit`, `--session`, `--verbose`, `--start` options added.
+
 ## 0.1.0 - 2026-10-22
 First build. Everything below was verified against **generated disk images** by `pytest`; see `docs/test-matrix.md` for what
 still needs a VM / real hardware.

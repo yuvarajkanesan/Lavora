@@ -194,7 +194,7 @@ def cmd_recover(a: argparse.Namespace) -> int:
 
         def show(f) -> None:
             if not f.ok or a.verbose or a.dry_run:
-                print(("would write " if a.dry_run else "FAIL ") + f.dest + (f"  {f.error}" if f.error else ""))
+                print(("would write " if a.dry_run else "ok   " if f.ok else "FAIL ") + f.dest + (f"  {f.error}" if f.error else ""))
 
         rep = recover(fs, entries, a.out, source=vol, license=lic, dry_run=a.dry_run, cancel=TOKEN, on_file=show,
                       keep_results=bool(a.report), byte_progress=_progress("copying file"))
@@ -263,6 +263,49 @@ def cmd_clone(a: argparse.Namespace) -> int:
                 ok = imaging.verify_copy(src, t, res.bad)
         print(f"\ncloned {_fmt_size(res.size)} to {a.target}; verify={'ok' if ok else 'MISMATCH'}")
         return 0 if ok and res.complete else 2
+
+
+def _parse_int(v: str) -> int:
+    return int(v, 0)
+
+
+def cmd_hex(a: argparse.Namespace) -> int:
+    from ..core import diskedit
+    with open_source(a.source) as src:
+        off = a.offset if a.lba is None else a.lba * 512
+        print(diskedit.hexview(src, off, a.length))
+        if a.describe:
+            info = diskedit.describe(src.read_at(off - off % 512, 512))
+            print("\n" + json.dumps(info, indent=2))
+    return 0
+
+
+def cmd_find(a: argparse.Namespace) -> int:
+    from ..core import diskedit
+    pattern = bytes.fromhex(a.hex) if a.hex else a.text.encode()
+    with open_source(a.source) as src:
+        n = 0
+        for off in diskedit.find(src, pattern, start=a.start, cancel=TOKEN, progress=_progress("searching"), limit=a.limit):
+            print(f"{off}  (0x{off:x}, LBA {off // 512})")
+            n += 1
+        print(f"{n} match(es)" + ("  [stopped]" if TOKEN.cancelled else ""))
+    return 130 if TOKEN.cancelled else 0
+
+
+def cmd_sector_write(a: argparse.Namespace) -> int:
+    from ..core import diskedit
+    with open(a.file, "rb") as f:
+        data = f.read()
+    if len(data) % 512:
+        raise CliError("the data file must be a whole number of 512-byte sectors")
+    if a.target.lower().startswith("\\\\.\\physicaldrive") or a.target.startswith("/dev/"):
+        safety.require_typed_confirmation(f"WRITE {a.lba}", a.confirm)
+    res = diskedit.write_sector(a.target, a.lba, data, dry_run=not a.apply)
+    if res.applied:
+        print(f"WRITTEN. Undo with: lavora-cli undo {res.undo_id}")
+    else:
+        print(f"dry run: would write {len(data)} bytes at LBA {a.lba} (add --apply; an undo snapshot is taken first)")
+    return 0
 
 
 def cmd_raid_detect(a: argparse.Namespace) -> int:
@@ -565,6 +608,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target")
     p.add_argument("--confirm", help='for a physical target: "ERASE <target>"')
     p.add_argument("--verify", action="store_true")
+    p = add("hex", cmd_hex, "hex view of a sector range (any source, read-only)")
+    p.add_argument("source")
+    p.add_argument("--offset", type=_parse_int, default=0)
+    p.add_argument("--lba", type=_parse_int)
+    p.add_argument("--length", type=_parse_int, default=512)
+    p.add_argument("--describe", action="store_true", help="decode MBR/GPT/NTFS/FAT fields")
+    p = add("find", cmd_find, "search a disk or image for bytes")
+    p.add_argument("source")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--hex")
+    g.add_argument("--text")
+    p.add_argument("--start", type=_parse_int, default=0)
+    p.add_argument("--limit", type=int, default=0)
+    p = add("sector-write", cmd_sector_write, "write whole sectors from a file (dry run unless --apply; undoable)")
+    p.add_argument("target")
+    p.add_argument("--lba", type=_parse_int, required=True)
+    p.add_argument("--file", required=True)
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--confirm", help='for physical disks: "WRITE <lba>"')
     p = add("raid-detect", cmd_raid_detect, "find level/chunk/layout/order of a RAID from its member images or disks")
     p.add_argument("members", nargs="+")
     p.add_argument("--level", help="restrict to levels, e.g. 5 or 0,5")

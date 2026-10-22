@@ -195,3 +195,18 @@ def test_gui_recover_flow_scans_an_image(monkeypatch, tmp_path, disk_path):
     page.filter.setText("holiday")
     page.apply_filter()  # the real UI debounces typing by 300 ms
     assert page.table.rowCount() == 1
+
+
+def test_gui_editor_page_shows_and_decodes_a_sector(monkeypatch, disk_path):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from lavora.gui.app import build_window
+    app = QApplication.instance() or QApplication([])
+    page = build_window(app).pages["editor"]
+    page.src.edit.setText(disk_path)
+    page.pos_edit.setText("0")
+    page.show_at()
+    assert "000000000000" in page.view.toPlainText() and "MBR" in page.info.toPlainText()
+    page.step(1024)
+    assert page.offset == 1024

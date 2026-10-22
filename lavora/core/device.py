@@ -155,4 +155,5 @@ def open_source(path: str) -> BlockSource:
         return open_raid_spec(path)
     if low.startswith("\\\\.\\physicaldrive") or low.startswith("/dev/"):
         return DeviceSource(path)
-    return ImageSource(path)
+    from .vdisk import open_virtual
+    return open_virtual(path) or ImageSource(path)

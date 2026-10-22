@@ -19,6 +19,23 @@ Legend: **done** = implemented and covered by automated tests on generated image
 - done: backup/restore, incremental, AES-256-GCM, verification by test-restore, schedule generation (Task Scheduler / systemd)
 - todo: SFTP/cloud destinations (needs an SSH library: approval pending), Btrfs/XFS, NTFS compressed/EFS/attribute lists
 
+## Added after the first build (commercial-tool parity round)
+- done: **multi-TB scale (tested on a synthetic and a real 5 TiB sparse image)**: streaming scans with bounded memory, cancel/Ctrl+C
+  everywhere (scan, recover, carve, partition scan, surface scan, imaging, backup, doctor), resume points (`carve --start`, imaging map,
+  backup chunk reuse), sampled overwrite estimates, popcount bitmap checks, bisect reads in fragmented files, lazy FAT chains,
+  hash-after-imaging is now opt-in (`--hash`), a full destination stops the run
+- done: **virtual RAID** 0/1/5/6/10 from images or disks, degraded reads (XOR and GF(256) P+Q), automatic detection of level, chunk size,
+  layout and member order (`raid-detect`, GUI RAID builder); `raid:` spec strings work as a source for every command
+- done: **virtual disks**: dynamic VHD, VHDX, VMDK (sparse + flat descriptor), VDI open like any image
+- done: **saved scan sessions** (`scan --save`, `recover --session`), recovery-chance summary after every scan
+- done: **disk editor**: hex view/search/decode in GUI and CLI (`hex`, `find`), `sector-write` (dry run, undo snapshot)
+- partial: RAID auto-detection is scored on partition tables, filesystem structures far apart on the volume, and file head/tail magic;
+  arrays holding only random data (encrypted volumes, databases) cannot be identified; tested on generated arrays only
+- todo (not started): ReFS, HFS+/APFS, XFS, UFS, Btrfs parsers (carving already works on any filesystem); recovery over the network from
+  remote machines (needs your approval: network code + a remote agent); differencing VHD/VHDX/VMDK chains; BitLocker unlock with
+  your own key done natively (today: manage-bde/cryptsetup wrappers); RAID 6 parameter auto-detection beyond the md layout,
+  non-standard levels (1E, 5E, 5EE, 6E)
+
 ## Phase 3
 - stub: Rescue ISO (recipe in `rescue/`, **not built or booted**); USB writer implemented and safety-tested, never run on real hardware
 - partial: Linux GRUB/chroot/initramfs/packages/fsck/kernel-rollback = **command plans**, fstab validator (tested); execution path exists but only with typed confirmation, on Linux

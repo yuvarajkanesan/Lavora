@@ -601,6 +601,159 @@ class PasswordPage(Page):
         lay.addStretch(1)
 
 
+class EditorPage(Page):
+    """Read-only hex viewer with a structure decoder and search. Writing sectors is a CLI feature (sector-write), on purpose."""
+
+    VIEW = 1024
+
+    def __init__(self, win: MainWindow):
+        super().__init__(win)
+        lay = self.header(tr("Disk editor"), tr("Look at any sector of a disk, image, virtual disk or RAID. Viewing never writes; to change sectors use the CLI sector-write (dry run, undo snapshot)."))
+        self.src = SourceRow()
+        self.pos_edit = QLineEdit("0")
+        self.pos_edit.setPlaceholderText(tr("Offset in bytes (0x... for hex)"))
+        go = QPushButton(tr("Go"))
+        go.clicked.connect(self.show_at)
+        prev_b, next_b = QPushButton("<"), QPushButton(">")
+        prev_b.clicked.connect(lambda: self.step(-self.VIEW))
+        next_b.clicked.connect(lambda: self.step(self.VIEW))
+        row = QHBoxLayout()
+        for w in (self.pos_edit, go, prev_b, next_b):
+            row.addWidget(w)
+        self.find_text = QLineEdit()
+        self.find_text.setPlaceholderText(tr("Search text (or hex: 0x4e544653)"))
+        find_b = QPushButton(tr("Find next"))
+        find_b.clicked.connect(self.find_next)
+        frow = QHBoxLayout()
+        frow.addWidget(self.find_text, 1)
+        frow.addWidget(find_b)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setStyleSheet("font-family: Consolas, 'Cascadia Mono', monospace;")
+        self.info = QPlainTextEdit()
+        self.info.setReadOnly(True)
+        self.info.setMaximumHeight(120)
+        lay.addWidget(self.src)
+        lay.addLayout(row)
+        lay.addLayout(frow)
+        lay.addWidget(self.view, 1)
+        lay.addWidget(self.info)
+        lay.addWidget(self.progress)
+        lay.addWidget(self.status)
+        self.offset = 0
+
+    def _offset(self) -> int:
+        return int(self.pos_edit.text().strip() or "0", 0)
+
+    def show_at(self, offset: int | None = None) -> None:
+        from ..core import diskedit
+        try:
+            self.offset = max(0, self._offset() if offset is None else offset)
+            self.offset -= self.offset % 16
+            with open_source(self.src.path) as s:
+                self.view.setPlainText(diskedit.hexview(s, self.offset, self.VIEW))
+                import json
+                self.info.setPlainText(json.dumps(diskedit.describe(s.read_at(self.offset - self.offset % 512, 512)), indent=2))
+                self.status.setText(tr("Size: {n} bytes").format(n=s.size))
+            self.pos_edit.setText(f"0x{self.offset:x}")
+        except Exception as ex:  # noqa: BLE001
+            QMessageBox.warning(self, NAME, str(ex))
+
+    def step(self, delta: int) -> None:
+        self.show_at(self.offset + delta)
+
+    def find_next(self) -> None:
+        from ..core import diskedit
+        txt = self.find_text.text().strip()
+        if not txt:
+            return
+        pattern = bytes.fromhex(txt[2:]) if txt.lower().startswith("0x") else txt.encode()
+        start = self.offset + 1
+
+        def job(progress):
+            with open_source(self.src.path) as s:
+                return next(iter(diskedit.find(s, pattern, start=start, cancel=self.token, progress=progress, limit=1)), None)
+
+        def done(off) -> None:
+            if off is None:
+                self.status.setText(tr("Not found (to the end of the source)") + (" " + tr("[stopped]") if self.token.cancelled else ""))
+            else:
+                self.show_at(off)
+
+        self.run_bg(job, done, tr("Searching... (cancel any time)"))
+
+
+class RaidPage(Page):
+    def __init__(self, win: MainWindow):
+        super().__init__(win)
+        lay = self.header(tr("RAID builder"), tr("Add the member disks or images (any order). Lavora finds the RAID level, chunk size, layout and member order, then you can scan and recover from the rebuilt array. Missing members are rebuilt from parity when the level allows."))
+        self.members = QPlainTextEdit()
+        self.members.setPlaceholderText(tr("One member per line: image file or \\\\.\\PhysicalDriveN"))
+        add = QPushButton(tr("Add images..."))
+        add.clicked.connect(self.add_files)
+        self.level = QComboBox()
+        self.level.addItem(tr("Auto-detect level"), None)
+        for lv in (0, 1, 5, 6, 10):
+            self.level.addItem(f"RAID {lv}", lv)
+        go = QPushButton(tr("Detect parameters"))
+        go.setObjectName("primary")
+        go.clicked.connect(self.detect)
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        use = QPushButton(tr("Use the best result in 'I deleted files'"))
+        use.clicked.connect(self.use_best)
+        row = QHBoxLayout()
+        row.addWidget(add)
+        row.addWidget(self.level)
+        row.addWidget(go)
+        lay.addWidget(self.members, 1)
+        lay.addLayout(row)
+        lay.addWidget(self.out, 1)
+        lay.addWidget(use)
+        lay.addWidget(self.progress)
+        lay.addWidget(self.status)
+        self.best_spec = ""
+
+    def add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, tr("Member images"), "", "Disk images (*.img *.dd *.raw *.vhd *.vhdx *.vmdk *.vdi);;All files (*)")
+        if paths:
+            self.members.appendPlainText("\n".join(paths))
+
+    def detect(self) -> None:
+        from ..core import raid
+        paths = [p.strip() for p in self.members.toPlainText().splitlines() if p.strip()]
+        lv = self.level.currentData()
+
+        def job(_progress):
+            mem = [open_source(p) for p in paths]
+            try:
+                return paths, raid.detect(mem, levels=None if lv is None else (lv,))
+            finally:
+                for m in mem:
+                    m.close()
+
+        def done(res) -> None:
+            ps, cands = res
+            if not cands:
+                self.out.setPlainText(tr("No layout produced a recognisable partition table or filesystem. Check that all members are present."))
+                self.best_spec = ""
+                return
+            self.out.setPlainText("\n".join(f"{i + 1}. {c.describe()}" for i, c in enumerate(cands)))
+            b = cands[0]
+            self.best_spec = raid.spec_for(b.level, b.chunk, b.layout, [ps[i] for i in b.order])
+            self.status.setText(self.best_spec)
+
+        self.run_bg(job, done, tr("Trying chunk sizes, layouts and member orders..."))
+
+    def use_best(self) -> None:
+        if not self.best_spec:
+            QMessageBox.information(self, NAME, tr("Run 'Detect parameters' first."))
+            return
+        page = self.win.pages["recover"]
+        page.src.edit.setText(self.best_spec)  # type: ignore[attr-defined]
+        self.win.show_page("recover")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -610,7 +763,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
         self.pages: dict[str, QWidget] = {"home": self._home()}
         for key, cls in (("recover", RecoverPage), ("doctor", DoctorPage), ("image", ImagePage), ("backup", BackupPage),
-                         ("boot", BootPage), ("password", PasswordPage)):
+                         ("boot", BootPage), ("password", PasswordPage), ("editor", EditorPage), ("raid", RaidPage)):
             self.pages[key] = cls(self)
         for p in self.pages.values():
             self.stack.addWidget(p)
@@ -636,7 +789,8 @@ class MainWindow(QMainWindow):
         accent = theme.PALETTES[detect_theme(QApplication.instance())]["accent"]  # type: ignore[arg-type]
         tiles = [("boot", tr("PC won't boot\nDiagnose and repair boot problems")), ("recover", tr("I deleted files\nScan, preview and recover")),
                  ("password", tr("Forgot password\nOwner-only account access")), ("image", tr("Disk is failing\nImage it first, recover from the image")),
-                 ("backup", tr("Back up my PC\nIncremental, encrypted, verified"))]
+                 ("backup", tr("Back up my PC\nIncremental, encrypted, verified")),
+                 ("raid", tr("RAID builder\nRebuild an array from its disks")), ("editor", tr("Disk editor\nHex view, search, decode"))]
         for i, (key, text) in enumerate(tiles):
             b = QPushButton(text)
             b.setObjectName("tile")
@@ -650,7 +804,7 @@ class MainWindow(QMainWindow):
         b.setIcon(icons.tile_icon("plans", accent))
         b.setIconSize(QSize(48, 48))
         b.clicked.connect(lambda: self.show_page("boot"))
-        grid.addWidget(b, 2, 1)
+        grid.addWidget(b, 3, 0)
         lay.addLayout(grid)
         lay.addStretch(1)
         note = QLabel(tr("Read-only by default. Recovery always goes to a different drive. No telemetry."))

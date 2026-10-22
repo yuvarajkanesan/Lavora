@@ -75,7 +75,19 @@ def _terminal(p: QPainter) -> None:
     p.drawLine(QPointF(46, 58), QPointF(62, 58))
 
 
-GLYPHS = {"boot": _power, "recover": _recover, "password": _key, "image": _disk_warning, "backup": _shield, "plans": _terminal}
+def _raid(p: QPainter) -> None:  # three stacked disks
+    for y in (24, 42, 60):
+        p.drawRoundedRect(QRectF(22, y, 52, 14), 6, 6)
+        p.drawPoint(QPointF(64, y + 7))
+
+
+def _editor(p: QPainter) -> None:  # a grid of hex cells
+    for r in range(3):
+        for c in range(3):
+            p.drawRoundedRect(QRectF(24 + c * 18, 26 + r * 16, 12, 10), 3, 3)
+
+
+GLYPHS = {"raid": _raid, "editor": _editor, "boot": _power, "recover": _recover, "password": _key, "image": _disk_warning, "backup": _shield, "plans": _terminal}
 
 
 def tile_icon(name: str, accent: str) -> QIcon:
