@@ -1,7 +1,8 @@
 """Sector-by-sector imaging with a ddrescue-style bad-sector map, pause/resume, compression, hashing and cloning.
 
-Pass 1 copies forward in large blocks and skips anything that errors. Pass 2 re-reads the skipped blocks in small
-steps and down to single sectors. Pass 3 retries the remaining bad sectors (in reverse order). Progress is kept in a
+Pass 1 copies forward in large blocks; when reads keep failing it jumps ahead (a dead zone is skipped, not ground through).
+Pass 2 re-reads what was skipped or failed, block by block, probing a failed block before dissecting it down to sectors.
+Pass 3 retries the remaining bad ranges in reverse order. Progress is kept in a
 JSON map file next to the image, so an interrupted job resumes where it stopped and the map documents what is lost.
 """
 from __future__ import annotations
@@ -63,6 +64,8 @@ class ImageJob:
         self.block, self.passes, self.compress, self.hash_result = block, passes, compress, hash_result
         self.cancel_fn = cancel_fn
         self.pos = 0  # offset being read right now (for live status)
+        self.errors: dict[str, int] = {}  # what the drive/OS actually said, with counts (kept in the map file too)
+        self.last_error = ""
         self.last_read_s = 0.0  # how long the last block took: a failing disk shows up here
         self.mapfile = mapfile or dest + ".map"
         self._run = threading.Event()
@@ -144,11 +147,10 @@ class ImageJob:
                 out.truncate(size)
             if self.state["pass"] == 1 and not self._pass1(out, progress):
                 return self._result(False, True)
-            if self.state["pass"] == 2 and self.passes >= 2 and not self._pass_retry(out, 2, self.state["suspect"], 4096, progress):
+            if self.state["pass"] == 2 and self.passes >= 2 and not self._refine(out, 2, self.state["suspect"], self.block, progress):
                 return self._result(False, True)
             for p in range(3, self.passes + 1):
-                if self.state["pass"] == p and not self._pass_retry(out, p, self.state["bad"], SECTOR, progress,
-                                                                    reverse=True):
+                if self.state["pass"] == p and not self._refine(out, p, self.state["bad"], 64 << 10, progress, reverse=True):
                     return self._result(False, True)
             self._ensure_size(out)
         self.state["pass"] = self.passes + 1
@@ -165,11 +167,51 @@ class ImageJob:
         return ImageResult(self.dest, self.source.size, merge_ranges(bad), complete and not bad, cancelled,
                            passes_done=min(self.state["pass"] - 1, self.passes))
 
+    # ---------------------------------------------------------------- low-level helpers
+    def _note_error(self, ex: OSError) -> None:
+        msg = f"{type(ex).__name__}" + (f" [Errno {ex.errno}]" if ex.errno else "") + f": {ex.strerror or ex}"
+        self.last_error = msg
+        if msg in self.errors or len(self.errors) < 20:
+            self.errors[msg] = self.errors.get(msg, 0) + 1
+        self.state["errors"] = dict(self.errors)
+
+    def _try(self, out, off: int, n: int) -> bool:
+        """Read [off, off+n) and write it to the image. False (and the error is recorded) if the source refuses."""
+        try:
+            data = self.source.read_exact(off, n)
+        except OSError as ex:
+            self._note_error(ex)
+            return False
+        out.seek(off)
+        out.write(data)
+        return True
+
+    @staticmethod
+    def _add(ranges: list[Range], off: int, ln: int) -> None:
+        """Append a range, merging with the previous one when contiguous (a 40 GB dead zone stays ONE entry)."""
+        if ranges and ranges[-1][0] + ranges[-1][1] == off:
+            ranges[-1] = (ranges[-1][0], ranges[-1][1] + ln)
+        else:
+            ranges.append((off, ln))
+
+    def _probe_dead(self, out, off: int, n: int) -> bool:
+        """True if the first, middle and last few KiB of the span all fail: the whole span is almost certainly unreadable,
+        so there is no point dissecting it sector by sector. Any probe that succeeds is kept."""
+        step = min(4096, n)
+        spots = {off, off + max(0, (n - step) // 2 // SECTOR * SECTOR), off + max(0, (n - step) // SECTOR * SECTOR)}
+        dead = True
+        for o in sorted(spots):
+            if self._try(out, o, min(step, off + n - o)):
+                dead = False
+        return dead
+
+    # ---------------------------------------------------------------- pass 1
     def _pass1(self, out, progress) -> bool:
         pos = self.state["next"]
         size = self.source.size
         suspect = [tuple(r) for r in self.state["suspect"]]
-        n = 0
+        n = streak = 0
+        skip = 0
         while pos < size:
             if self._checkpoint():
                 self.state["suspect"] = [list(r) for r in suspect]
@@ -179,14 +221,20 @@ class ImageJob:
             ln = min(self.block, size - pos)
             self.pos = pos
             t0 = time.perf_counter()
-            try:
-                data = self.source.read_exact(pos, ln)
-                out.seek(pos)
-                out.write(data)
-            except OSError:
-                suspect.append((pos, ln))
+            ok = self._try(out, pos, ln)
             self.last_read_s = time.perf_counter() - t0
             pos += ln
+            if ok:
+                streak = skip = 0
+            else:
+                self._add(suspect, pos - ln, ln)
+                streak += 1
+                if streak >= 8 and pos < size:  # a dead zone: jump ahead, growing the jump; pass 2 revisits what was skipped
+                    skip = min(max(skip * 2, 4 * self.block), 1 << 30)
+                    jump = min(skip, size - pos) // SECTOR * SECTOR
+                    if jump:
+                        self._add(suspect, pos, jump)
+                        pos += jump
             n += 1
             if progress:
                 progress(pos, size)
@@ -198,48 +246,65 @@ class ImageJob:
         self._save()
         return True
 
-    def _pass_retry(self, out, pass_no: int, todo: list, step: int, progress, reverse: bool = False) -> bool:
-        ranges = [tuple(r) for r in todo]
-        still_bad: list[Range] = []
-        ordered = sorted(ranges, reverse=reverse)
+    # ---------------------------------------------------------------- passes 2 and 3
+    def _refine(self, out, pass_no: int, todo: list, block: int, progress, reverse: bool = False) -> bool:
+        """Re-read `todo` ranges block by block. A failed block is probed; only if some probe works is it dissected into 4 KiB
+        steps and then sectors. After 16 dead blocks in a row the pass samples ahead (one probe per 16 blocks) so a huge dead
+        zone costs minutes, not days. Returns False if cancelled (state saved so the next run resumes)."""
+        ordered = sorted((tuple(r) for r in todo), reverse=reverse)
+        bad: list[Range] = [tuple(r) for r in self.state["bad"]] if pass_no == 2 else []  # pass 3 rebuilds the list from scratch
         for idx, (off, ln) in enumerate(ordered):
-            chunks = list(range(off, off + ln, step))
-            if reverse:
-                chunks.reverse()
-            for c in chunks:
+            end = off + ln
+            pos, streak = (off, 0) if not reverse else (end, 0)
+            while (pos < end) if not reverse else (pos > off):
                 if self._checkpoint():
-                    # keep what is not yet retried
-                    rest = still_bad + [(o, n) for o, n in ordered[idx:]]
-                    self._store(pass_no, rest)
+                    rest = [(pos, end - pos)] if not reverse and pos < end else ([(off, pos - off)] if reverse and pos > off else [])
+                    rest += ordered[idx + 1:]
+                    self._save_progress(pass_no, rest, bad)
                     return False
-                n = min(step, off + ln - c)
-                try:
-                    data = self.source.read_exact(c, n)
-                    out.seek(c)
-                    out.write(data)
-                except OSError:
-                    if step > SECTOR:  # fall back to sector granularity
-                        for s in range(c, c + n, SECTOR):
-                            sn = min(SECTOR, c + n - s)
-                            try:
-                                data = self.source.read_exact(s, sn)
-                                out.seek(s)
-                                out.write(data)
-                            except OSError:
-                                still_bad.append((s, sn))
-                    else:
-                        still_bad.append((c, n))
-            if progress:
-                progress(off + ln, self.source.size)
+                n = min(block, end - pos) if not reverse else min(block, pos - off)
+                start = pos if not reverse else pos - n
+                self.pos = start
+                if self._try(out, start, n):
+                    streak = 0
+                elif not self._probe_dead(out, start, n):
+                    for c in range(start, start + n, 4096):  # something here is readable: go finer
+                        cn = min(4096, start + n - c)
+                        if not self._try(out, c, cn):
+                            for sct in range(c, c + cn, SECTOR):
+                                sn = min(SECTOR, c + cn - sct)
+                                if not self._try(out, sct, sn):
+                                    self._add(bad, sct, sn)
+                    streak = 0
+                else:
+                    self._add(bad, start, n)
+                    streak += 1
+                pos = pos + n if not reverse else pos - n
+                if streak >= 16:  # dead zone: sample ahead
+                    window = 16 * block
+                    while (pos < end) if not reverse else (pos > off):
+                        w = min(window, end - pos) if not reverse else min(window, pos - off)
+                        ws = pos if not reverse else pos - w
+                        pn = min(block, w)
+                        if self._try(out, ws if not reverse else ws + w - pn, pn):
+                            break  # readable again: back to block-by-block (the window edge is retried by pass 3)
+                        self._add(bad, ws, w)
+                        pos = pos + w if not reverse else pos - w
+                    streak = 0
+                if progress:
+                    progress(min(max(pos, off), end), self.source.size)
         self.state["suspect"] = []
-        self.state["bad"] = [list(r) for r in merge_ranges(still_bad)]
+        self.state["bad"] = [list(r) for r in merge_ranges(bad)]
         self.state["pass"] = pass_no + 1
         self._save()
         return True
 
-    def _store(self, pass_no: int, rest: list[Range]) -> None:
-        key = "suspect" if pass_no == 2 else "bad"
-        self.state[key] = [list(r) for r in merge_ranges(rest)]
+    def _save_progress(self, pass_no: int, rest: list[Range], bad: list[Range]) -> None:
+        if pass_no == 2:
+            self.state["suspect"] = [list(r) for r in merge_ranges(rest)]
+            self.state["bad"] = [list(r) for r in merge_ranges(bad)]
+        else:  # pass 3: whatever is not retried yet stays bad, plus what failed again
+            self.state["bad"] = [list(r) for r in merge_ranges(rest + bad)]
         self._save()
 
     def _compress(self) -> str:

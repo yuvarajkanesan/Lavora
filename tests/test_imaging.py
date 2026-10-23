@@ -152,3 +152,50 @@ def test_vhd_footer_is_not_part_of_the_disk(tmp_path):
     p.write_bytes(data + bytes(footer))
     with ImageSource(str(p)) as s:
         assert s.size == 8192 and s.read_at(0, 8192) == data
+
+
+# ------------------------------------------------------------------ dead zones (a drive/bridge that refuses a whole LBA range)
+class DeadZoneSource(BlockSource):
+    """Healthy data except one contiguous range where every read fails at once with EIO, like the 33-76 GiB zone on a real disk."""
+
+    def __init__(self, data: bytes, start: int, end: int):
+        self._data, self.start, self.end, self.size, self.path = data, start, end, len(data), "<deadzone>"
+        self.reads = 0
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        self.reads += 1
+        if offset < self.end and offset + length > self.start:
+            raise OSError(5, "Input/output error")
+        return self._data[offset:offset + length]
+
+
+def test_a_contiguous_dead_zone_is_mapped_as_one_range_quickly_and_the_error_is_kept(tmp_path):
+    import time
+    disk = payload(3, 96 << 20)
+    start, end = 20_000_256, 20_000_256 + (60 << 20)  # sector-aligned, not block-aligned
+    src = DeadZoneSource(disk, start, end)
+    job = imaging.ImageJob(src, str(tmp_path / "dz.img"), block=1 << 18, passes=3)
+    t = time.perf_counter()
+    res = job.run()
+    elapsed = time.perf_counter() - t
+    assert elapsed < 60
+    assert res.bad == [(start, end - start)]  # exactly the dead zone, nothing around it lost, nothing readable marked bad
+    img = (tmp_path / "dz.img").read_bytes()
+    assert img[:start] == disk[:start] and img[end:] == disk[end:]
+    assert len(img) == len(disk)
+    # the map file stays tiny (one range) and records what the drive actually said
+    import json
+    st = json.load(open(job.mapfile))
+    assert st["bad"] == [[start, end - start]] and st["suspect"] == []
+    assert any("Input/output error" in m and "[Errno 5]" in m for m in st["errors"]) and job.last_error
+    # far fewer reads than probing every sector of the zone (which would be ~120,000 reads)
+    assert src.reads < 20_000
+
+
+def test_pass_one_jumps_over_a_dead_zone_instead_of_reading_every_block(tmp_path):
+    disk = payload(4, 64 << 20)
+    src = DeadZoneSource(disk, 8 << 20, 56 << 20)
+    job = imaging.ImageJob(src, str(tmp_path / "j.img"), block=1 << 18, passes=1)  # passes=1: pass 1 only
+    job.run()
+    # without jumping, pass 1 alone would issue 256 reads for the zone; with growing jumps it needs far fewer
+    assert src.reads < 150

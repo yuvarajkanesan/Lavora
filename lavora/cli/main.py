@@ -248,6 +248,8 @@ def cmd_image(a: argparse.Namespace) -> int:
             return 130
         if res.bad:
             print(f"bad-sector map: {job.mapfile}")
+            for msg, count in sorted(job.errors.items(), key=lambda kv: -kv[1]):
+                print(f"  the drive reported: {msg} ({count} refused reads)")
         return 0 if res.complete else 2
 
 

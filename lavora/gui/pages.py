@@ -466,6 +466,10 @@ class ImagePage(Page):
                 p=fmt_size(job.pos), s=stalled))
         else:
             self.status.setText(tr("Reading at {p}; last block took {t:.2f} s").format(p=fmt_size(job.pos), t=job.last_read_s))
+        if job.errors:  # what the drive / Windows actually answered, so a failing disk can be told from a driver problem
+            total = sum(job.errors.values())
+            self.status.setText(self.status.text() + "\n" + tr("Unreadable areas are skipped first and retried afterwards. The drive reported: {e} ({n} refused reads so far).").format(
+                e=job.last_error, n=f"{total:,}"))
         self.stats["bad"].setText(f"{bad // 512:,}")
         self.stats["retries"].setText(str(max(0, st.get("pass", 1) - 1)))
 
