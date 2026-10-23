@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..brand import NAME
-from ..core import backup, doctor, imaging, license, raid, undo
+from ..core import backup, doctor, imaging, license, raid, safety, undo
 from ..core.device import open_source
 from ..i18n import tr
 from . import icons
@@ -417,6 +417,7 @@ class ImagePage(Page):
         self._poll.timeout.connect(self._refresh_stats)
         self._image_path = ""
         self._progress_pair = (0, 0)
+        self._seen_done, self._seen_at = 0, 0.0
 
     def _busy(self, on: bool, label: str = "") -> None:
         self.cancel_btn.setVisible(on)
@@ -428,6 +429,7 @@ class ImagePage(Page):
             self.stepper.set_step(2)
             self._t0 = time.monotonic()
             self._last = (self._t0, 0)
+            self._seen_done, self._seen_at = 0, self._t0
             self._poll.start()
         else:
             self._poll.stop()
@@ -456,6 +458,14 @@ class ImagePage(Page):
                 secs = (size - done) / speed
                 self.stats["left"].setText(f"{int(secs // 3600)} h {int(secs % 3600 // 60)} min" if secs >= 3600 else f"{int(secs // 60)} min {int(secs % 60)} s")
         self.stats["copied"].setText(f"{fmt_size(done)} / {fmt_size(size)}")
+        if done != self._seen_done:
+            self._seen_done, self._seen_at = done, now
+        stalled = now - self._seen_at
+        if stalled > 8:
+            self.status.setText(tr("Waiting for the disk to answer at {p} ({s:.0f} s without progress). The drive may be slow or failing; you can cancel safely and resume later.").format(
+                p=fmt_size(job.pos), s=stalled))
+        else:
+            self.status.setText(tr("Reading at {p}; last block took {t:.2f} s").format(p=fmt_size(job.pos), t=job.last_read_s))
         self.stats["bad"].setText(f"{bad // 512:,}")
         self.stats["retries"].setText(str(max(0, st.get("pass", 1) - 1)))
 
@@ -480,12 +490,18 @@ class ImagePage(Page):
             base = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in base)
             dest = os.path.join(dest, f"lavora-{base}.img")
         self._image_path = dest
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)  # the chosen folder may not exist yet
+        except OSError as ex:
+            QMessageBox.warning(self, NAME, str(ex))
+            return
 
         def job(progress):
             def wrapped(d, t):
                 self._progress_pair = (d, t)
                 progress(d, t)
             with open_source(self.src.path) as s:
+                safety.check_output_location(s, dest)  # never write the image onto the disk being imaged
                 self._job = imaging.ImageJob(s, dest, cancel_fn=self.token)
                 return self._job.run(wrapped)
 

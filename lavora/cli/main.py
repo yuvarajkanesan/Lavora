@@ -239,6 +239,7 @@ def cmd_carve(a: argparse.Namespace) -> int:
 def cmd_image(a: argparse.Namespace) -> int:
     license.current().require("imaging")
     with open_source(a.source) as src:
+        safety.check_output_location(src, a.dest)  # never write the image onto the disk being imaged
         job = imaging.ImageJob(src, a.dest, passes=a.passes, compress=a.compress, hash_result=a.hash, cancel_fn=TOKEN)
         res = job.run(_progress("imaging"))
         print(f"\nimage: {res.path}  complete={res.complete}  bad bytes={res.bad_bytes}  sha256={res.sha256 or 'not computed (use --hash)'}")

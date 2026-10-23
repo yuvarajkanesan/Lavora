@@ -346,3 +346,34 @@ def test_doctor_scan_of_a_wrecked_5tib_disk_can_be_cancelled():
     n = []
     findings, dt = timed(lambda: doctor.diagnose(disk, cancel=lambda: n.append(1) or len(n) > 3))
     assert dt < 10 and disk.bytes_read < 64 << 20 and findings
+
+
+def test_imaging_a_huge_source_does_not_preallocate_or_zero_fill_the_destination(tmp_path):
+    """Regression: file.truncate(size) zero-fills on Windows, so imaging a 931 GiB disk sat at 0 B for hours."""
+    disk = VirtualDisk(20 * 1024 ** 3, {0: b"HEAD" * 128})
+    n = []
+    job = imaging.ImageJob(disk, str(tmp_path / "big.img"), block=1 << 20, cancel_fn=lambda: n.append(1) or len(n) > 5)
+    res, dt = timed(job.run)
+    assert res.cancelled and dt < 10
+    if os.name == "nt":  # the file only grows as blocks are written
+        assert (tmp_path / "big.img").stat().st_size < 64 << 20
+    assert (tmp_path / "big.img").read_bytes()[:4] == b"HEAD"
+
+
+def test_imaging_refuses_up_front_when_the_destination_is_too_small(tmp_path, monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: shutil._ntuple_diskusage(100 << 30, 99 << 30, 1 << 30))
+    job = imaging.ImageJob(VirtualDisk(931 * 1024 ** 3), str(tmp_path / "x.img"))
+    with pytest.raises(OSError, match="Not enough free space"):
+        job.run()
+    assert not (tmp_path / "x.img").exists()  # nothing was created, nothing to clean up
+
+
+def test_physical_disks_are_read_in_smaller_blocks_and_live_status_is_exposed(tmp_path):
+    class Dev(VirtualDisk):
+        is_device = True
+    assert imaging.ImageJob(Dev(1 << 30), str(tmp_path / "a.img")).block == 256 << 10
+    assert imaging.ImageJob(VirtualDisk(1 << 30), str(tmp_path / "b.img")).block == 1 << 20
+    src = VirtualDisk(8 << 20)
+    job = imaging.ImageJob(src, str(tmp_path / "c.img"), block=1 << 20)
+    assert job.run().complete and job.pos > 0 and job.last_read_s >= 0

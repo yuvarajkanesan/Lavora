@@ -11,7 +11,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -48,8 +50,11 @@ class ImageResult:
 
 
 class ImageJob:
-    def __init__(self, source: BlockSource, dest: str, *, block: int = 1 << 20, passes: int = 3,
+    def __init__(self, source: BlockSource, dest: str, *, block: int | None = None, passes: int = 3,
                  mapfile: str | None = None, compress: bool = False, hash_result: bool = False, cancel_fn=None):
+        # physical disks get smaller reads: on a failing drive one unreadable block can cost many seconds of retries inside the
+        # driver, so a smaller block bounds the damage and keeps progress visible
+        block = block or ((256 << 10) if source.is_device else (1 << 20))
         if block % SECTOR:
             raise ValueError("block size must be a multiple of 512")
         if os.path.exists(dest) and not mapfile and os.path.getsize(dest) and not os.path.exists(dest + ".map"):
@@ -57,6 +62,8 @@ class ImageJob:
         self.source, self.dest = source, dest
         self.block, self.passes, self.compress, self.hash_result = block, passes, compress, hash_result
         self.cancel_fn = cancel_fn
+        self.pos = 0  # offset being read right now (for live status)
+        self.last_read_s = 0.0  # how long the last block took: a failing disk shows up here
         self.mapfile = mapfile or dest + ".map"
         self._run = threading.Event()
         self._run.set()
@@ -96,12 +103,45 @@ class ImageJob:
         return self._cancel or bool(self.cancel_fn and self.cancel_fn())
 
     # ---------------------------------------------------------------- the copy
+    def _check_space(self) -> None:
+        """Fail at once, with a clear message, instead of discovering a full destination hours in."""
+        if self.compress:
+            return
+        have = os.path.getsize(self.dest) if os.path.exists(self.dest) else 0
+        need = max(0, self.source.size - have)
+        folder = os.path.dirname(os.path.abspath(self.dest)) or "."
+        free = shutil.disk_usage(folder).free
+        if need + (64 << 20) > free:
+            gib = 1 << 30
+            raise OSError(f"Not enough free space on the destination: the image needs {need / gib:.0f} GiB but only {free / gib:.0f} GiB is free. "
+                          "Choose a bigger drive, or turn on compression.")
+
+    def _ensure_size(self, out) -> None:
+        """Make the image exactly as long as the source. POSIX truncate() is an instant sparse extend; on Windows it zero-fills the
+        file as it grows (hours for a 1 TB image), so there the file just grows as blocks are written and only a missing tail is
+        padded here."""
+        size = self.source.size
+        if sys.platform != "win32":
+            out.truncate(size)
+            return
+        out.seek(0, os.SEEK_END)
+        pos = out.tell()
+        zeros = bytes(8 << 20)
+        while pos < size:
+            if self._checkpoint():
+                return
+            n = min(len(zeros), size - pos)
+            out.write(zeros[:n])
+            pos += n
+
     def run(self, progress: Callable[[int, int], None] | None = None) -> ImageResult:
         self._load()
         size = self.source.size
+        self._check_space()
         mode = "r+b" if os.path.exists(self.dest) else "w+b"
         with open(self.dest, mode) as out:
-            out.truncate(size)
+            if sys.platform != "win32":
+                out.truncate(size)
             if self.state["pass"] == 1 and not self._pass1(out, progress):
                 return self._result(False, True)
             if self.state["pass"] == 2 and self.passes >= 2 and not self._pass_retry(out, 2, self.state["suspect"], 4096, progress):
@@ -110,6 +150,7 @@ class ImageJob:
                 if self.state["pass"] == p and not self._pass_retry(out, p, self.state["bad"], SECTOR, progress,
                                                                     reverse=True):
                     return self._result(False, True)
+            self._ensure_size(out)
         self.state["pass"] = self.passes + 1
         self._save()
         res = self._result(True, False)
@@ -136,12 +177,15 @@ class ImageJob:
                 self._save()
                 return False
             ln = min(self.block, size - pos)
+            self.pos = pos
+            t0 = time.perf_counter()
             try:
                 data = self.source.read_exact(pos, ln)
                 out.seek(pos)
                 out.write(data)
             except OSError:
                 suspect.append((pos, ln))
+            self.last_read_s = time.perf_counter() - t0
             pos += ln
             n += 1
             if progress:
