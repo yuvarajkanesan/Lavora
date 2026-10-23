@@ -482,8 +482,11 @@ class ImagePage(Page):
             QMessageBox.information(self, NAME, str(ex))
             return
         dest = self.dest.text().strip()
-        if not self.src.path or not dest:
-            QMessageBox.information(self, NAME, tr("Choose the failing disk and where to save the image."))
+        if not self.src.path:
+            QMessageBox.information(self, NAME, tr("Choose the failing disk first (type its path, or use Detect disks)."))
+            return
+        if not dest:
+            QMessageBox.information(self, NAME, tr("Choose where to save the image: a folder on a different drive with enough free space."))
             return
         if os.path.isdir(dest) or not dest.lower().endswith((".img", ".dd", ".raw")):
             base = os.path.splitext(os.path.basename(self.src.path.rstrip("\\/")))[0] or "disk"

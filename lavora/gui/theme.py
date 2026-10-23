@@ -33,6 +33,12 @@ QStackedWidget {{ background: transparent; }}
 QWidget#root {{ background: {c['bg']}; }}
 QScrollArea {{ border: none; }}
 
+/* dialogs (message boxes, input dialogs): the global 'transparent' rule would otherwise leave them black */
+QDialog, QMessageBox, QInputDialog {{ background: {c['panel']}; }}
+QMessageBox QLabel, QInputDialog QLabel, QDialog QLabel {{ background: transparent; color: {c['text']}; font-size: 15px; }}
+QMessageBox QPushButton, QInputDialog QPushButton, QDialog QPushButton {{ min-width: 90px; }}
+QDialogButtonBox {{ background: transparent; }}
+
 /* top bar */
 QFrame#topbar {{ background: {c['topbar']}; border: none; border-bottom: 1px solid {c['border']}; }}
 QLabel#brand {{ font-size: 21px; font-weight: 700; }}
