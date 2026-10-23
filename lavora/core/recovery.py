@@ -15,6 +15,7 @@ from .device import BlockSource
 from .fs.base import FileEntry, Filesystem, FsError, UnsupportedError
 from .license import License, LicenseRequired
 from .safety import SafetyError, check_output_location
+from .unread import missing_percent
 
 _INVALID = re.compile(r'[<>:"|?*\x00-\x1f]')
 IMAGE_EXT = {"jpg", "jpeg", "png", "gif", "bmp", "webp"}
@@ -84,6 +85,7 @@ class RecoveredFile:
     sha256: str = ""
     bytes_written: int = 0
     error: str = ""
+    missing_pct: float = 0.0  # share of the file that lies in the unread part of a partial image
 
     @property
     def ok(self) -> bool:
@@ -96,6 +98,7 @@ class RecoveryReport:
     dry_run: bool = False
     recovered: int = 0
     failed: int = 0
+    incomplete: int = 0  # recovered, but partly from unread areas of a partial image (their data contains zeros)
     bytes_written: int = 0
     cancelled: bool = False
     stopped_reason: str = ""  # e.g. the destination is full
@@ -140,7 +143,7 @@ def estimate(entries: Iterable[FileEntry]) -> dict:
 def recover(fs: Filesystem, entries: Iterable[FileEntry], out_dir: str, *, source: BlockSource | None = None,
             license: License | None = None, dry_run: bool = False, keep_paths: bool = True, progress=None,
             byte_progress=None, cancel: Callable[[], bool] | None = None, on_file=None, keep_results: bool = True,
-            disk_lookup=None) -> RecoveryReport:
+            disk_lookup=None, unread: list[tuple[int, int]] | None = None, volume_base: int = 0) -> RecoveryReport:
     """Copy `entries` out of the filesystem into `out_dir`, streaming (any number of files, any file size).
 
     Refuses when `out_dir` is on the source disk, and when the Free-tier size cap would be exceeded. `cancel()` is polled
@@ -166,7 +169,12 @@ def recover(fs: Filesystem, entries: Iterable[FileEntry], out_dir: str, *, sourc
             report.cancelled = True
             break
         rel = safe_relative_path(e.path if keep_paths else e.name)
-        dest = os.path.join(out_dir, "recovered" if e.deleted else "existing", rel)
+        missing = 0.0
+        if unread:  # partial image: which files touch what was never copied?
+            ranges = fs.byte_ranges(e)
+            missing = missing_percent(ranges, unread, volume_base) if ranges else 0.0
+        top = "incomplete (partly unread)" if missing > 0 else "recovered" if e.deleted else "existing"
+        dest = os.path.join(out_dir, top, rel)
         base, ext = os.path.splitext(dest)
         n = 1
         while dest.lower() in used or (not dry_run and os.path.exists(dest)):
@@ -174,7 +182,7 @@ def recover(fs: Filesystem, entries: Iterable[FileEntry], out_dir: str, *, sourc
             n += 1
         if len(used) < 2_000_000:  # name de-duplication memory is bounded; the exists() check covers the rest
             used.add(dest.lower())
-        rf = RecoveredFile(e, dest)
+        rf = RecoveredFile(e, dest, missing_pct=missing)
         if not dry_run:
             try:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -213,6 +221,7 @@ def recover(fs: Filesystem, entries: Iterable[FileEntry], out_dir: str, *, sourc
                     break
         if rf.ok:
             report.recovered += 1
+            report.incomplete += missing > 0
         else:
             report.failed += 1
         if keep_results or not rf.ok:

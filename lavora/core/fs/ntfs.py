@@ -284,6 +284,12 @@ class NtfsFilesystem(Filesystem):
             entry.path = f"{parent}/{entry.name}" if parent else f"$OrphanFiles/{entry.name}"
             yield entry
 
+    def byte_ranges(self, entry: FileEntry) -> list[tuple[int, int]] | None:
+        rec = self._record(entry.ref)
+        if rec is None or rec.data is None or rec.data.resident is not None:
+            return []  # nothing, or small enough to live inside its MFT record
+        return [(lcn * self.cluster, count * self.cluster) for lcn, count in rec.data.runs if lcn is not None]
+
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         if entry.note.startswith("unsupported"):
             raise UnsupportedError(entry.note)

@@ -362,6 +362,10 @@ class ImagePage(Page):
         self.go_btn.setObjectName("primary")
         self.go_btn.clicked.connect(self.go)
         form.lay.addWidget(self.go_btn)
+        self.partial_btn = QPushButton(tr("Recover what's copied so far"))
+        self.partial_btn.clicked.connect(self.partial_recover)
+        form.lay.addWidget(self.partial_btn)
+        form.lay.addWidget(_hint(tr("Stuck or too slow? Stop imaging safely and recover files from the part that is already copied. You can resume imaging later.")))
         left.addWidget(form)
 
         prog = Card((36, 28, 36, 30), 14)
@@ -417,10 +421,13 @@ class ImagePage(Page):
         self._poll.timeout.connect(self._refresh_stats)
         self._image_path = ""
         self._progress_pair = (0, 0)
+        self._goto_recover = False
+        self._running = False
         self._seen_done, self._seen_at = 0, 0.0
         self._ema: float | None = None
 
     def _busy(self, on: bool, label: str = "") -> None:
+        self._running = on
         self.cancel_btn.setVisible(on)
         self.go_btn.setEnabled(not on)
         if on:
@@ -482,11 +489,41 @@ class ImagePage(Page):
         self.stats["bad"].setText(f"{bad // 512:,}")
         self.stats["retries"].setText(str(job.retries))
 
-    def _to_recover(self) -> None:
+    def _to_recover(self, autostart: bool = False) -> None:
         page = self.win.pages["recover"]
         if self._image_path:
             page.src.edit.setText(self._image_path)  # type: ignore[attr-defined]
         self.win.show_page("recover")
+        if autostart and self._image_path:
+            page.start_scan()  # type: ignore[attr-defined]
+
+    def _dest_path(self) -> str:
+        """The image file this page writes: the chosen folder plus a name derived from the disk (or the file path typed in)."""
+        dest = self.dest.text().strip()
+        if not dest or not self.src.path:
+            return ""
+        if os.path.isdir(dest) or not dest.lower().endswith((".img", ".dd", ".raw")):
+            base = os.path.splitext(os.path.basename(self.src.path.rstrip("\\/")))[0] or "disk"
+            base = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in base)
+            dest = os.path.join(dest, f"lavora-{base}.img")
+        return dest
+
+    def partial_recover(self) -> None:
+        """Stop imaging (if it is running) and go straight to recovering from whatever has been copied so far."""
+        path = self._dest_path() or self._image_path
+        if not path or not os.path.exists(path):
+            QMessageBox.information(self, NAME, tr("There is no image yet. Start 'Create image' and let it copy for a while first."))
+            return
+        self._image_path = path
+        if self._running:  # imaging is running
+            answer = QMessageBox.question(self, NAME, tr("Stop imaging now and recover from the part that is already copied?\n\nNothing is lost: the copy position is saved, so you can resume imaging later."))
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._goto_recover = True
+            self.status.setText(tr("Stopping safely..."))
+            self.token.cancel()
+            return
+        self._to_recover(autostart=True)
 
     def go(self) -> None:
         try:
@@ -494,17 +531,13 @@ class ImagePage(Page):
         except license.LicenseRequired as ex:
             QMessageBox.information(self, NAME, str(ex))
             return
-        dest = self.dest.text().strip()
         if not self.src.path:
             QMessageBox.information(self, NAME, tr("Choose the failing disk first (type its path, or use Detect disks)."))
             return
-        if not dest:
+        if not self.dest.text().strip():
             QMessageBox.information(self, NAME, tr("Choose where to save the image: a folder on a different drive with enough free space."))
             return
-        if os.path.isdir(dest) or not dest.lower().endswith((".img", ".dd", ".raw")):
-            base = os.path.splitext(os.path.basename(self.src.path.rstrip("\\/")))[0] or "disk"
-            base = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in base)
-            dest = os.path.join(dest, f"lavora-{base}.img")
+        dest = self._dest_path()
         self._image_path = dest
         try:
             os.makedirs(os.path.dirname(dest), exist_ok=True)  # the chosen folder may not exist yet
@@ -523,6 +556,11 @@ class ImagePage(Page):
 
         def done(r) -> None:
             self._refresh_stats()
+            if self._goto_recover:
+                self._goto_recover = False
+                self.state_tag.set_tone("warn", tr("Stopped"))
+                self._to_recover(autostart=True)
+                return
             if r.cancelled:
                 self.state_tag.set_tone("warn", tr("Stopped"))
                 self.status.setText(tr("Stopped. Press Create image again to resume from where it stopped."))

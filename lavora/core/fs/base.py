@@ -67,6 +67,11 @@ class Filesystem(ABC):
     def scan(self, *, include_live: bool = True, progress=None, cancel=None) -> Iterator[FileEntry]:
         """Yield files and directories (deleted ones flagged). `cancel()` returning True stops the scan promptly."""
 
+    def byte_ranges(self, entry: FileEntry) -> list[tuple[int, int]] | None:
+        """Where the file's data lives, as (offset, length) pairs relative to the volume start. None = this filesystem cannot say.
+        Used to tell which files touch the unread part of a partial image."""
+        return None
+
     @abstractmethod
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         """Read content of `entry`."""

@@ -30,6 +30,7 @@ from ..core import (
 )
 from ..core import partitions as parts
 from ..core import rescue as rescue_mod
+from ..core import unread as unread_mod
 from ..core.cancel import CancelToken, install_sigint
 from ..core.device import BlockSource, PartitionView, open_source
 from ..core.fs import FsError, open_filesystem
@@ -196,9 +197,15 @@ def cmd_recover(a: argparse.Namespace) -> int:
             if not f.ok or a.verbose or a.dry_run:
                 print(("would write " if a.dry_run else "ok   " if f.ok else "FAIL ") + f.dest + (f"  {f.error}" if f.error else ""))
 
+        unread = unread_mod.load_unread(a.source) if os.path.isfile(a.source) else None  # partial image: flag affected files
+        base = vol.offset if isinstance(vol, PartitionView) else 0
+        if unread:
+            print(f"note: this image is incomplete ({_fmt_size(unread_mod.unread_total(unread))} never copied); "
+                  "files touching it go to 'incomplete (partly unread)'")
         rep = recover(fs, entries, a.out, source=vol, license=lic, dry_run=a.dry_run, cancel=TOKEN, on_file=show,
-                      keep_results=bool(a.report), byte_progress=_progress("copying file"))
+                      keep_results=bool(a.report), byte_progress=_progress("copying file"), unread=unread, volume_base=base)
         print(f"\n{rep.recovered} recovered ({_fmt_size(rep.bytes_written)}), {rep.failed} failed" +
+              (f", {rep.incomplete} incomplete (partly unread)" if rep.incomplete else "") +
               (" (dry run, nothing written)" if a.dry_run else "") + ("  [cancelled]" if rep.cancelled else "") +
               (f"  [{rep.stopped_reason}]" if rep.stopped_reason else ""))
         if a.report:

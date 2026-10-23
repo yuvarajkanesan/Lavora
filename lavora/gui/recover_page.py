@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import threading
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
@@ -33,6 +34,7 @@ from ..core.device import BlockSource, PartitionView, open_source
 from ..core.fs import FsError, open_filesystem
 from ..core.fs.base import FileEntry
 from ..core.recovery import Estimate, iter_entries, preview, recover
+from ..core.unread import load_unread, missing_percent, unread_total
 from ..i18n import tr
 from . import icons
 from .base import Page, SourceRow
@@ -54,17 +56,29 @@ def fmt_size(n: float) -> str:
     return str(n)
 
 
+def _level(pct: float) -> str:
+    return "high" if pct >= 85 else "medium" if pct >= 40 else "low"
+
+
 def chance_for(e: FileEntry) -> tuple[str, tuple[float, str, str] | None]:
-    """(state text, (percent, label, level)) for a table row. level drives the bar colour: high / medium / low."""
+    """(state text, (percent, label, level)) for a table row. level drives the bar colour: high / medium / low.
+    Files that touch the unread part of a partial image are marked, and their chance is reduced by the missing share."""
+    unread = float(e.extra.get("unread_pct", 0.0)) if e.extra else 0.0
     if not e.deleted:
+        if unread > 0:
+            pct = max(0.0, 100.0 - unread)
+            return tr("Unread") if unread >= 99.5 else tr("Partly unread"), (pct, f"{tr(_level(pct).capitalize())} · {pct:.0f}%", _level(pct))
         return tr("Present"), None
     if e.note.startswith("unsupported"):
         return tr("Unsupported"), (0.0, tr("Unknown"), "low")
     if e.overwritten_pct >= 100:
         return tr("Overwritten"), (0.0, tr("Lost") + " · 0%", "low")
-    pct = min(99.0, 100.0 - e.overwritten_pct)
-    level = "high" if pct >= 85 else "medium" if pct >= 40 else "low"
-    state = tr("Deleted") if e.overwritten_pct == 0 else tr("Partly overwritten") if e.overwritten_pct < 60 else tr("Mostly overwritten")
+    pct = min(99.0, 100.0 - e.overwritten_pct) * (1.0 - unread / 100.0)
+    level = _level(pct)
+    if unread > 0:
+        state = tr("Unread") if unread >= 99.5 else tr("Partly unread")
+    else:
+        state = tr("Deleted") if e.overwritten_pct == 0 else tr("Partly overwritten") if e.overwritten_pct < 60 else tr("Mostly overwritten")
     return state, (pct, f"{tr(level.capitalize())} · {pct:.0f}%", level)
 
 
@@ -87,6 +101,8 @@ class RecoverPage(Page):
         self.entries: list[FileEntry] = []
         self.shown: list[FileEntry] = []
         self.carved: list = []
+        self.unread: list[tuple[int, int]] | None = None  # parts of a partial image that were never copied
+        self.base = 0  # volume start inside the image
         self.fs = None
         self.vol: BlockSource | None = None
         self._ext_filter: set[str] | None = None
@@ -462,11 +478,13 @@ class RecoverPage(Page):
             vol = self._volume()
             fs = open_filesystem(vol)
             out = list(itertools.islice(fs.scan(include_live=live, progress=progress, cancel=self.token), self.MAX_ENTRIES + 1))
-            return vol, fs, out
+            unread = load_unread(self.src.path) if os.path.isfile(self.src.path) else None
+            return vol, fs, out, unread
         self.run_bg(job, self.scanned, tr("Scanning for deleted files... (you can cancel; what was found so far is kept)"))
 
     def scanned(self, res) -> None:
-        self.vol, self.fs, self.entries = res
+        self.vol, self.fs, self.entries, self.unread = res
+        self.base = self.vol.offset if isinstance(self.vol, PartitionView) else 0
         capped = len(self.entries) > self.MAX_ENTRIES
         if capped:
             self.entries = self.entries[:self.MAX_ENTRIES]
@@ -476,11 +494,15 @@ class RecoverPage(Page):
             est.add(e)
         n = est.deleted if not self.include_live.isChecked() else est.files
         word = tr("deleted files") if not self.include_live.isChecked() else tr("files")
+        partial = ""
+        if self.unread:
+            miss = unread_total(self.unread)
+            partial = " · " + tr("this image is incomplete: {s} was never copied; affected files are marked and recovered separately").format(s=fmt_size(miss))
         if self.token.cancelled:
             self.banner.show_message("warn", tr("Scan stopped: partial list, {n} {w} so far").format(n=n, w=word))
         else:
             extra = (" · " + tr("list capped at {n}; use the CLI for the rest").format(n=self.MAX_ENTRIES)) if capped else ""
-            self.banner.show_message("success", tr("Scan complete: {n} {w} found").format(n=n, w=word) + extra)
+            self.banner.show_message("warn" if partial else "success", tr("Scan complete: {n} {w} found").format(n=n, w=word) + extra + partial)
         self.stepper.set_step(3)
         self.apply_filter()
 
@@ -539,6 +561,7 @@ class RecoverPage(Page):
         exts = self._ext_filter
         shown = list(itertools.islice(iter_entries(self.entries, exts=exts, name_contains=self.filter.text().strip()), MAX_ROWS))
         self.shown = shown
+        self._annotate(shown)
         self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(0)
@@ -549,6 +572,20 @@ class RecoverPage(Page):
         self.table.blockSignals(False)
         self._update_selection()
         self._update_empty()
+
+    def _annotate(self, entries: list[FileEntry]) -> None:
+        """For a partial image: work out, per displayed file, how much of it lies in never-copied areas."""
+        if not self.unread or self.fs is None:
+            return
+        for e in entries:
+            try:
+                ranges = self.fs.byte_ranges(e)
+            except Exception:  # noqa: BLE001 - a damaged record must not break the list
+                continue
+            if ranges:
+                pct = missing_percent(ranges, self.unread, self.base)
+                if pct > 0:
+                    e.extra["unread_pct"] = pct
 
     def _fill_table_carved(self) -> None:
         self.table.blockSignals(True)
@@ -674,7 +711,7 @@ class RecoverPage(Page):
                     done.append(carver.extract(self.vol, self.carved[r], out))
                 return done
             return recover(self.fs, [self.shown[r] for r in rows], out, source=self.vol, license=lic, cancel=self.token,
-                           byte_progress=progress)  # progress inside the current file, so a 2 TB file shows movement
+                           byte_progress=progress, unread=self.unread, volume_base=self.base)  # progress inside the current file, so a 2 TB file shows movement
 
         def finished(rep) -> None:
             n = len(rep) if isinstance(rep, list) else rep.recovered
@@ -682,6 +719,8 @@ class RecoverPage(Page):
                 msg = tr("Recovered {n} file(s) to {p}").format(n=n, p=out)
                 msg += " · " + (tr("cancelled") if rep.cancelled else rep.stopped_reason or tr("{f} failed").format(f=rep.failed))
                 self.banner.show_message("warn", msg)
+            elif not isinstance(rep, list) and rep.incomplete:
+                self.banner.show_message("warn", tr("Recovered {n} file(s) to {p}; {k} are incomplete (partly from unread areas) and were saved in the 'incomplete (partly unread)' folder").format(n=n, p=out, k=rep.incomplete))
             else:
                 self.banner.show_message("success", tr("Recovered {n} file(s) to {p}").format(n=n, p=out))
         self.run_bg(job, finished, tr("Recovering... (you can cancel; no half-written files are left)"))

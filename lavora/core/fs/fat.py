@@ -94,6 +94,20 @@ def _read_span(source, chain: ChainMap, coff, cluster: int, offset: int, length:
     return bytes(out)
 
 
+def _chain_ranges(chain: ChainMap, clusters: int, coff, cluster: int) -> list[tuple[int, int]]:
+    """Byte ranges of the first `clusters` clusters of a chain, one entry per contiguous run."""
+    chain.locate(max(0, clusters - 1))
+    out, left = [], clusters
+    for first, count in chain.runs:
+        take = min(count, left)
+        if take > 0:
+            out.append((coff(first), take * cluster))
+        left -= take
+        if left <= 0:
+            break
+    return out
+
+
 def _lfn_matches(short: bytes, checksum: int, deleted: bool) -> bool:
     """A deleted entry's first byte was overwritten with 0xE5, so try every value it may have had."""
     if not deleted:
@@ -252,6 +266,17 @@ class FatFilesystem(Filesystem):
         self._cancel = cancel
         yield from self._walk(self.root_cluster, "", False, set(), include_live)
 
+    def byte_ranges(self, entry: FileEntry) -> list[tuple[int, int]] | None:
+        if entry.ref < 2 or not entry.size:
+            return []
+        n = (entry.size + self.cluster - 1) // self.cluster
+        if entry.deleted:
+            return [(self._cluster_off(entry.ref), n * self.cluster)]
+        cm = self._chain_maps.get(entry.ref)
+        if cm is None:
+            cm = self._chain_maps[entry.ref] = ChainMap(entry.ref, self.fat_entry, lambda c: 2 <= c < self.clusters + 2, self.eoc)
+        return _chain_ranges(cm, n, self._cluster_off, self.cluster)
+
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         length = entry.size - offset if length is None else min(length, entry.size - offset)
         if length <= 0 or entry.ref < 2:
@@ -364,6 +389,17 @@ class ExfatFilesystem(Filesystem):
     def scan(self, *, include_live: bool = True, progress=None, cancel: Callable[[], bool] | None = None) -> Iterator[FileEntry]:
         self._cancel = cancel
         yield from self._walk(self.root, False, 0, "", include_live, set())
+
+    def byte_ranges(self, entry: FileEntry) -> list[tuple[int, int]] | None:
+        if entry.ref < 2 or not entry.size:
+            return []
+        n = (entry.size + self.cluster - 1) // self.cluster
+        if entry.extra.get("contiguous", False):
+            return [(self._coff(entry.ref), n * self.cluster)]
+        cm = self._chain_maps.get(entry.ref)
+        if cm is None:
+            cm = self._chain_maps[entry.ref] = ChainMap(entry.ref, self._fat, lambda c: 2 <= c < self.clusters + 2, 0xFFFFFFF8)
+        return _chain_ranges(cm, n, self._coff, self.cluster)
 
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         length = entry.size - offset if length is None else min(length, entry.size - offset)

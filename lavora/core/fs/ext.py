@@ -282,6 +282,12 @@ class ExtFilesystem(Filesystem):
                     fe.note = "best effort (journalled filesystem)"
             yield fe
 
+    def byte_ranges(self, entry: FileEntry) -> list[tuple[int, int]] | None:
+        raw = self._inode_raw(entry.ref)
+        if raw is None:
+            return []
+        return [(p * self.bs, ln * self.bs) for _l, p, ln in self._extents(self._fields(raw), entry.deleted)]
+
     def read(self, entry: FileEntry, offset: int = 0, length: int | None = None) -> bytes:
         raw = self._inode_raw(entry.ref)
         if raw is None:
