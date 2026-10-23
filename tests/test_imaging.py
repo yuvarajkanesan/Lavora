@@ -199,3 +199,52 @@ def test_pass_one_jumps_over_a_dead_zone_instead_of_reading_every_block(tmp_path
     job.run()
     # without jumping, pass 1 alone would issue 256 reads for the zone; with growing jumps it needs far fewer
     assert src.reads < 150
+
+
+# ------------------------------------------------------------------ USB bridge resets (Windows: UASPStor event 129 -> "Permission denied")
+class ResettingSource(BlockSource):
+    """Behaves like a USB disk whose bridge drops out: the read in flight when it happens fails with EACCES; after the pause and a
+    fresh handle (reopen) it works again."""
+
+    def __init__(self, data: bytes, drop_at: set[int]):
+        self._data, self.size, self.path = data, len(data), "<usb>"
+        self.drop_at, self.reopens, self._broken = set(drop_at), 0, False
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        for d in list(self.drop_at):
+            if offset <= d < offset + length:
+                self.drop_at.discard(d)
+                self._broken = True
+        if self._broken:
+            raise PermissionError(13, "Permission denied")
+        return self._data[offset:offset + length]
+
+    def reopen(self) -> None:
+        self.reopens += 1
+        self._broken = False
+
+
+def test_a_bus_reset_is_ridden_out_and_those_blocks_are_not_marked_bad(tmp_path):
+    disk = payload(8, 8 << 20)
+    src = ResettingSource(disk, {1 << 20, 5 << 20, (5 << 20) + (700 << 10)})
+    job = imaging.ImageJob(src, str(tmp_path / "r.img"), block=1 << 18, passes=2)
+    job.retry_pause = 0.01
+    res = job.run()
+    assert res.complete and not res.bad and (tmp_path / "r.img").read_bytes() == disk
+    assert job.retries == 3 and src.reopens == 3
+    assert job.errors == {"PermissionError [Errno 13]: Permission denied": 3}
+
+
+def test_a_dead_zone_does_not_pause_or_reopen_for_every_block(tmp_path):
+    class Dead(ResettingSource):
+        def read_at(self, offset: int, length: int) -> bytes:
+            if offset < 4 << 20 and offset + length > 2 << 20:
+                raise OSError(5, "Input/output error")
+            return self._data[offset:offset + length]
+    disk = payload(9, 6 << 20)
+    src = Dead(disk, set())
+    job = imaging.ImageJob(src, str(tmp_path / "d.img"), block=1 << 18, passes=3)
+    job.retry_pause = 0.01
+    res = job.run()
+    assert res.bad == [(2 << 20, 2 << 20)]
+    assert src.reopens < 12  # a retry per streak, never one per block (8 blocks fail in pass 1, then the zone is skipped)

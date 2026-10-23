@@ -418,6 +418,7 @@ class ImagePage(Page):
         self._image_path = ""
         self._progress_pair = (0, 0)
         self._seen_done, self._seen_at = 0, 0.0
+        self._ema: float | None = None
 
     def _busy(self, on: bool, label: str = "") -> None:
         self.cancel_btn.setVisible(on)
@@ -430,6 +431,7 @@ class ImagePage(Page):
             self._t0 = time.monotonic()
             self._last = (self._t0, 0)
             self._seen_done, self._seen_at = 0, self._t0
+            self._ema = None
             self._poll.start()
         else:
             self._poll.stop()
@@ -450,12 +452,17 @@ class ImagePage(Page):
         done = min(size, max(st.get("next", 0), self._progress_pair[0]))
         bad = sum(ln for _o, ln in (st.get("suspect", []) + st.get("bad", [])))
         now = time.monotonic()
-        speed = (done - self._last[1]) / max(now - self._last[0], 1e-6) if now - self._last[0] >= 0.5 else None
-        if speed is not None:
+        if now - self._last[0] >= 0.5:
+            inst = (done - self._last[1]) / (now - self._last[0])
             self._last = (now, done)
+            # smoothed: a drive that stalls for a minute and then bursts must not flash "0 B/s" and "800 h left"
+            self._ema = inst if self._ema is None else 0.15 * inst + 0.85 * self._ema
+            avg = done / max(now - self._t0, 1e-6)
+            speed = max(self._ema, avg * 0.5) if self._ema is not None else avg
             self.stats["speed"].setText(fmt_size(speed) + "/s")
-            if speed > 0 and size > done:
-                secs = (size - done) / speed
+            remaining = size - done
+            if avg > 0 and remaining > 0:
+                secs = remaining / avg  # based on the average since the start: stable even across stalls
                 self.stats["left"].setText(f"{int(secs // 3600)} h {int(secs % 3600 // 60)} min" if secs >= 3600 else f"{int(secs // 60)} min {int(secs % 60)} s")
         self.stats["copied"].setText(f"{fmt_size(done)} / {fmt_size(size)}")
         if done != self._seen_done:
@@ -471,7 +478,7 @@ class ImagePage(Page):
             self.status.setText(self.status.text() + "\n" + tr("Unreadable areas are skipped first and retried afterwards. The drive reported: {e} ({n} refused reads so far).").format(
                 e=job.last_error, n=f"{total:,}"))
         self.stats["bad"].setText(f"{bad // 512:,}")
-        self.stats["retries"].setText(str(max(0, st.get("pass", 1) - 1)))
+        self.stats["retries"].setText(str(job.retries))
 
     def _to_recover(self) -> None:
         page = self.win.pages["recover"]

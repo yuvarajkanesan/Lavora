@@ -64,6 +64,9 @@ class ImageJob:
         self.block, self.passes, self.compress, self.hash_result = block, passes, compress, hash_result
         self.cancel_fn = cancel_fn
         self.pos = 0  # offset being read right now (for live status)
+        self.retries = 0  # reads that failed once, then succeeded after a pause and a fresh handle (bus resets)
+        self.retry_pause = 4.0  # seconds to let a dropped drive come back before the retry
+        self._fail_streak = 0
         self.errors: dict[str, int] = {}  # what the drive/OS actually said, with counts (kept in the map file too)
         self.last_error = ""
         self.last_read_s = 0.0  # how long the last block took: a failing disk shows up here
@@ -175,16 +178,41 @@ class ImageJob:
             self.errors[msg] = self.errors.get(msg, 0) + 1
         self.state["errors"] = dict(self.errors)
 
+    def _pause(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not self._checkpoint():
+            time.sleep(0.1)
+
     def _try(self, out, off: int, n: int) -> bool:
-        """Read [off, off+n) and write it to the image. False (and the error is recorded) if the source refuses."""
-        try:
-            data = self.source.read_exact(off, n)
-        except OSError as ex:
-            self._note_error(ex)
-            return False
-        out.seek(off)
-        out.write(data)
-        return True
+        """Read [off, off+n) and write it to the image. False (and the error is recorded) if the source refuses.
+
+        The first failure after good reads is usually a USB bridge reset, not bad media: Windows aborts the in-flight read with
+        "Permission denied" and resets the device a few seconds later. So that one failure is retried after a short pause on a
+        fresh handle, which keeps those blocks out of the bad-sector map. Consecutive failures are not paused (a real dead zone
+        must not cost seconds per block)."""
+        for attempt in (0, 1):
+            try:
+                data = self.source.read_exact(off, n)
+            except OSError as ex:
+                self._note_error(ex)
+                if attempt == 0 and self._fail_streak == 0 and self.retry_pause > 0 and hasattr(self.source, "reopen"):
+                    self._pause(self.retry_pause)
+                    try:
+                        self.source.reopen()
+                    except OSError as ex2:
+                        self._note_error(ex2)
+                        self._fail_streak += 1
+                        return False
+                    continue
+                self._fail_streak += 1
+                return False
+            if attempt:
+                self.retries += 1
+            self._fail_streak = 0
+            out.seek(off)
+            out.write(data)
+            return True
+        return False
 
     @staticmethod
     def _add(ranges: list[Range], off: int, ln: int) -> None:

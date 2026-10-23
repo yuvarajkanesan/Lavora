@@ -93,6 +93,13 @@ class DeviceSource(BlockSource):
         skip = offset - start
         return raw[skip:skip + length]
 
+    def reopen(self) -> None:
+        """Open a fresh read-only handle. After a USB bridge reset the old handle may keep failing, a new one works again."""
+        try:
+            self._fh.close()
+        finally:
+            self._fh = open(self.path, "rb", buffering=0)  # noqa: SIM115 - closed in close()
+
     def close(self) -> None:
         self._fh.close()
 
