@@ -52,7 +52,8 @@ class ImageResult:
 
 class ImageJob:
     def __init__(self, source: BlockSource, dest: str, *, block: int | None = None, passes: int = 3,
-                 mapfile: str | None = None, compress: bool = False, hash_result: bool = False, cancel_fn=None):
+                 mapfile: str | None = None, compress: bool = False, hash_result: bool = False, cancel_fn=None,
+                 min_speed: int = 1_000_000):
         # physical disks get smaller reads: on a failing drive one unreadable block can cost many seconds of retries inside the
         # driver, so a smaller block bounds the damage and keeps progress visible
         block = block or ((256 << 10) if source.is_device else (1 << 20))
@@ -64,6 +65,8 @@ class ImageJob:
         self.block, self.passes, self.compress, self.hash_result = block, passes, compress, hash_result
         self.cancel_fn = cancel_fn
         self.pos = 0  # offset being read right now (for live status)
+        self.min_speed = min_speed  # bytes/s: areas that read slower than this are skipped first and revisited last
+        self.skipped_slow = 0  # bytes jumped over because the drive was crawling there
         self.retries = 0  # reads that failed once, then succeeded after a pause and a fresh handle (bus resets)
         self.retry_pause = 4.0  # seconds to let a dropped drive come back before the retry
         self._fail_streak = 0
@@ -150,7 +153,7 @@ class ImageJob:
                 out.truncate(size)
             if self.state["pass"] == 1 and not self._pass1(out, progress):
                 return self._result(False, True)
-            if self.state["pass"] == 2 and self.passes >= 2 and not self._refine(out, 2, self.state["suspect"], self.block, progress):
+            if self.state["pass"] == 2 and self.passes >= 2 and not self._refine(out, 2, self.state["suspect"], self.block, progress, defer_slow=True):
                 return self._result(False, True)
             for p in range(3, self.passes + 1):
                 if self.state["pass"] == p and not self._refine(out, p, self.state["bad"], 64 << 10, progress, reverse=True):
@@ -190,13 +193,13 @@ class ImageJob:
         "Permission denied" and resets the device a few seconds later. So that one failure is retried after a short pause on a
         fresh handle, which keeps those blocks out of the bad-sector map. Consecutive failures are not paused (a real dead zone
         must not cost seconds per block)."""
-        for attempt in (0, 1):
+        for attempt in range(4):
             try:
                 data = self.source.read_exact(off, n)
             except OSError as ex:
                 self._note_error(ex)
-                if attempt == 0 and self._fail_streak == 0 and self.retry_pause > 0 and hasattr(self.source, "reopen"):
-                    self._pause(self.retry_pause)
+                if attempt < 3 and self._fail_streak == 0 and self.retry_pause > 0 and hasattr(self.source, "reopen"):
+                    self._pause(self.retry_pause * (1, 2.5, 5)[attempt])  # e.g. 4 s, 10 s, 20 s
                     try:
                         self.source.reopen()
                     except OSError as ex2:
@@ -252,16 +255,19 @@ class ImageJob:
             ok = self._try(out, pos, ln)
             self.last_read_s = time.perf_counter() - t0
             pos += ln
-            if ok:
+            slow = ok and self.min_speed > 0 and self.last_read_s > ln / self.min_speed
+            if ok and not slow:
                 streak = skip = 0
             else:
-                self._add(suspect, pos - ln, ln)
+                if not ok:
+                    self._add(suspect, pos - ln, ln)  # (a slow block was read fine: its data is already in the image)
                 streak += 1
-                if streak >= 8 and pos < size:  # a dead zone: jump ahead, growing the jump; pass 2 revisits what was skipped
+                if streak >= (8 if not ok else 4) and pos < size:  # dead or crawling zone: jump ahead, growing the jump
                     skip = min(max(skip * 2, 4 * self.block), 1 << 30)
                     jump = min(skip, size - pos) // SECTOR * SECTOR
                     if jump:
-                        self._add(suspect, pos, jump)
+                        self._add(suspect, pos, jump)  # pass 2 revisits what was skipped
+                        self.skipped_slow += jump if slow else 0
                         pos += jump
             n += 1
             if progress:
@@ -275,25 +281,41 @@ class ImageJob:
         return True
 
     # ---------------------------------------------------------------- passes 2 and 3
-    def _refine(self, out, pass_no: int, todo: list, block: int, progress, reverse: bool = False) -> bool:
+    def _refine(self, out, pass_no: int, todo: list, block: int, progress, reverse: bool = False, defer_slow: bool = False) -> bool:
         """Re-read `todo` ranges block by block. A failed block is probed; only if some probe works is it dissected into 4 KiB
         steps and then sectors. After 16 dead blocks in a row the pass samples ahead (one probe per 16 blocks) so a huge dead
         zone costs minutes, not days. Returns False if cancelled (state saved so the next run resumes)."""
         ordered = sorted((tuple(r) for r in todo), reverse=reverse)
         bad: list[Range] = [tuple(r) for r in self.state["bad"]] if pass_no == 2 else []  # pass 3 rebuilds the list from scratch
+        deferred: list[Range] = []  # crawling areas: read last, once everything that reads fast is safe
+        slow_streak = 0
         for idx, (off, ln) in enumerate(ordered):
             end = off + ln
             pos, streak = (off, 0) if not reverse else (end, 0)
             while (pos < end) if not reverse else (pos > off):
                 if self._checkpoint():
                     rest = [(pos, end - pos)] if not reverse and pos < end else ([(off, pos - off)] if reverse and pos > off else [])
-                    rest += ordered[idx + 1:]
+                    rest += ordered[idx + 1:] + deferred
                     self._save_progress(pass_no, rest, bad)
                     return False
                 n = min(block, end - pos) if not reverse else min(block, pos - off)
                 start = pos if not reverse else pos - n
                 self.pos = start
-                if self._try(out, start, n):
+                t0 = time.perf_counter()
+                got = self._try(out, start, n)
+                self.last_read_s = time.perf_counter() - t0
+                if got and defer_slow and not reverse and self.min_speed > 0 and self.last_read_s > n / self.min_speed:
+                    slow_streak += 1
+                    if slow_streak >= 4 and start + n < end:  # crawling: park the rest of this range for later
+                        park = min(16 * block, end - (start + n))
+                        deferred.append((start + n, park))
+                        self.skipped_slow += park
+                        pos = start + n + park
+                        progress and progress(min(pos, end), self.source.size)
+                        continue
+                else:
+                    slow_streak = 0
+                if got:
                     streak = 0
                 elif not self._probe_dead(out, start, n):
                     for c in range(start, start + n, 4096):  # something here is readable: go finer
@@ -321,6 +343,11 @@ class ImageJob:
                     streak = 0
                 if progress:
                     progress(min(max(pos, off), end), self.source.size)
+        if deferred:  # now take the slow areas, accepting whatever speed they give
+            self.state["suspect"] = [list(r) for r in merge_ranges(deferred)]
+            self.state["bad"] = [list(r) for r in merge_ranges(bad)]
+            self._save()
+            return self._refine(out, pass_no, deferred, block, progress, reverse, defer_slow=False)
         self.state["suspect"] = []
         self.state["bad"] = [list(r) for r in merge_ranges(bad)]
         self.state["pass"] = pass_no + 1

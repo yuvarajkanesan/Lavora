@@ -248,3 +248,40 @@ def test_a_dead_zone_does_not_pause_or_reopen_for_every_block(tmp_path):
     res = job.run()
     assert res.bad == [(2 << 20, 2 << 20)]
     assert src.reopens < 12  # a retry per streak, never one per block (8 blocks fail in pass 1, then the zone is skipped)
+
+
+# ------------------------------------------------------------------ crawling areas (a weak HDD that answers, but at 200 KB/s)
+class SlowZoneSource(BlockSource):
+    def __init__(self, data: bytes, start: int, end: int, delay: float):
+        self._data, self.size, self.path = data, len(data), "<slow>"
+        self.start, self.end, self.delay, self.log = start, end, delay, []
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        import time
+        self.log.append(offset)
+        if offset < self.end and offset + length > self.start:
+            time.sleep(self.delay)
+        return self._data[offset:offset + length]
+
+
+def test_slow_areas_are_skipped_first_and_visited_last_with_all_data_intact(tmp_path):
+    disk = payload(11, 48 << 20)
+    start, end = 8 << 20, 24 << 20
+    src = SlowZoneSource(disk, start, end, delay=0.02)  # 256 KiB per 20 ms = 13 MB/s, below the 50 MB/s test threshold
+    job = imaging.ImageJob(src, str(tmp_path / "s.img"), block=1 << 18, passes=2, min_speed=50_000_000)
+    res = job.run()
+    assert res.complete and (tmp_path / "s.img").read_bytes() == disk  # nothing lost: slow is not bad
+    assert job.skipped_slow > 0
+    first = {}
+    for i, off in enumerate(src.log):
+        first.setdefault(off, i)
+    inside = min(o for o in first if start + (6 << 20) <= o < end)
+    after = min(o for o in first if o >= end + (1 << 20))
+    assert first[after] < first[inside]  # the healthy area behind the slow zone was copied before the zone's interior
+
+
+def test_speed_floor_can_be_disabled(tmp_path):
+    disk = payload(12, 8 << 20)
+    src = SlowZoneSource(disk, 0, 8 << 20, delay=0.005)
+    job = imaging.ImageJob(src, str(tmp_path / "n.img"), block=1 << 18, min_speed=0)
+    assert job.run().complete and job.skipped_slow == 0

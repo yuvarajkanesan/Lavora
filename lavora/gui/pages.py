@@ -473,6 +473,8 @@ class ImagePage(Page):
                 p=fmt_size(job.pos), s=stalled))
         else:
             self.status.setText(tr("Reading at {p}; last block took {t:.2f} s").format(p=fmt_size(job.pos), t=job.last_read_s))
+        if job.skipped_slow:
+            self.status.setText(self.status.text() + "\n" + tr("The drive is reading very slowly in places. Lavora skips slow areas first ({s} so far) and comes back to them last, so the healthy data is safe sooner. You can stop at any time.").format(s=fmt_size(job.skipped_slow)))
         if job.errors:  # what the drive / Windows actually answered, so a failing disk can be told from a driver problem
             total = sum(job.errors.values())
             self.status.setText(self.status.text() + "\n" + tr("Unreadable areas are skipped first and retried afterwards. The drive reported: {e} ({n} refused reads so far).").format(
