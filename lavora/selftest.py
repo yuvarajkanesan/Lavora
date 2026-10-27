@@ -31,7 +31,7 @@ def run() -> int:
         from .gui.app import build_window
         app = QApplication.instance() or QApplication([])
         win = build_window(app)  # type: ignore[arg-type]
-        assert len(win.pages) == 9
+        assert len(win.pages) >= 11 and "auto" in win.pages and "health" in win.pages
 
     def crypto_and_backup() -> None:
         import shutil
