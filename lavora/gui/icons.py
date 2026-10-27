@@ -122,6 +122,17 @@ def _chevron_d(p: QPainter) -> None:
     p.drawPolyline([QPointF(24, 36), QPointF(48, 62), QPointF(72, 36)])
 
 
+def _auto(p: QPainter) -> None:  # circular arrow: "do it all"
+    p.drawArc(QRectF(22, 22, 52, 52), 40 * 16, 280 * 16)
+    p.drawPolyline([QPointF(62, 14), QPointF(72, 28), QPointF(56, 32)])
+    p.drawLine(QPointF(48, 38), QPointF(48, 52))
+    p.drawPolyline([QPointF(41, 46), QPointF(48, 53), QPointF(55, 46)])
+
+
+def _pulse(p: QPainter) -> None:  # heartbeat line
+    p.drawPolyline([QPointF(14, 50), QPointF(32, 50), QPointF(40, 28), QPointF(52, 70), QPointF(60, 50), QPointF(82, 50)])
+
+
 def _check(p: QPainter) -> None:
     p.drawPolyline([QPointF(22, 50), QPointF(40, 68), QPointF(74, 30)])
 
@@ -145,7 +156,7 @@ def _drive(p: QPainter) -> None:
 GLYPHS: dict[str, Callable[[QPainter], None]] = {
     "boot": _power, "recover": _recover, "password": _key, "image": _disk_alert, "backup": _shield, "plans": _terminal,
     "raid": _raid, "editor": _editor, "file": _file, "search": _search, "lock": _lock, "eye-off": _eye_off,
-    "chevron-right": _chevron_r, "chevron-down": _chevron_d, "chevron-left": _chevron_l, "check": _check, "check-circle": _check_circle,
+    "auto": _auto, "health": _pulse, "chevron-right": _chevron_r, "chevron-down": _chevron_d, "chevron-left": _chevron_l, "check": _check, "check-circle": _check_circle,
     "info-circle": _info_circle, "drive": _drive, "shield": _shield,
 }
 

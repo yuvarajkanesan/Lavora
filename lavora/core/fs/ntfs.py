@@ -123,24 +123,27 @@ def parse_record(number: int, rec: bytearray) -> MftRecord | None:
 class NtfsFilesystem(Filesystem):
     name = "ntfs"
 
-    def __init__(self, source: BlockSource):
+    def __init__(self, source: BlockSource, *, use_mirror: bool = False):
         super().__init__(source)
+        self.used_mirror = use_mirror
         boot = source.read_at(0, 512)
         if len(boot) < 512 or boot[3:11] != b"NTFS    ":
             raise FsError("not an NTFS volume (boot sector signature missing)")
         self.bps, self.spc = struct.unpack_from("<HB", boot, 11)
         self.total_sectors = struct.unpack_from("<Q", boot, 40)[0]
         mft_lcn = struct.unpack_from("<Q", boot, 48)[0]
+        mirror_lcn = struct.unpack_from("<Q", boot, 56)[0]
         cpr = struct.unpack_from("<b", boot, 64)[0]
         self.cluster = self.bps * self.spc
         self.record_size = cpr * self.cluster if cpr > 0 else 1 << -cpr
         if not (self.bps and self.spc and 256 <= self.record_size <= 65536):
             raise FsError("implausible NTFS geometry")
         self.total_clusters = self.total_sectors // self.spc
-        first = bytearray(source.read_at(mft_lcn * self.cluster, self.record_size))
+        # the first four MFT records are mirrored (at $MFTMirr): if record 0 is damaged, its copy still names the MFT's data runs
+        first = bytearray(source.read_at((mirror_lcn if use_mirror else mft_lcn) * self.cluster, self.record_size))
         rec0 = parse_record(0, first)
         if not rec0 or not rec0.data:
-            raise FsError("$MFT record 0 is unreadable")
+            raise FsError("$MFT record 0 is unreadable" + (" (mirror too)" if use_mirror else ""))
         self.mft = rec0.data
         self.mft_count = self.mft.real_size // self.record_size
         self._bm_ds: DataStream | bool | None = None

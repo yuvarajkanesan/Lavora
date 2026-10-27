@@ -362,10 +362,10 @@ class ImagePage(Page):
         self.go_btn.setObjectName("primary")
         self.go_btn.clicked.connect(self.go)
         form.lay.addWidget(self.go_btn)
-        self.partial_btn = QPushButton(tr("Recover what's copied so far"))
+        self.partial_btn = QPushButton(tr("Recover everything from what's copied so far"))
         self.partial_btn.clicked.connect(self.partial_recover)
         form.lay.addWidget(self.partial_btn)
-        form.lay.addWidget(_hint(tr("Stuck or too slow? Stop imaging safely and recover files from the part that is already copied. You can resume imaging later.")))
+        form.lay.addWidget(_hint(tr("Stuck or too slow? Stop imaging safely and recover everything from the part that is already copied. You can resume imaging later.")))
         left.addWidget(form)
 
         prog = Card((36, 28, 36, 30), 14)
@@ -406,7 +406,7 @@ class ImagePage(Page):
         intro.setStyleSheet("font-size: 16px;")
         why.lay.addWidget(intro)
         steps = NumberedList([tr("Reads the disk sector by sector."), tr("Maps bad sectors and retries them."), tr("Saves the image to a different drive."),
-                              tr("Hands the image to") + ' <a href="recover" style="color:#5b3fd1;">' + tr("I deleted files") + "</a> " + tr("to scan and recover.")], self.theme, size=16)
+                              tr("Hands the image to") + ' <a href="recover" style="color:#5b3fd1;">' + tr("Recover everything") + "</a> " + tr("to get your files back in one click.")], self.theme, size=16)
         steps.linkActivated.connect(lambda _l: self._to_recover())
         why.lay.addWidget(steps)
         cols.addWidget(why, 2, Qt.AlignmentFlag.AlignTop)
@@ -490,12 +490,11 @@ class ImagePage(Page):
         self.stats["retries"].setText(str(job.retries))
 
     def _to_recover(self, autostart: bool = False) -> None:
-        page = self.win.pages["recover"]
+        """Hand the image over to 'Recover everything' (it still needs a destination folder, so it never starts by itself)."""
+        page = self.win.pages["auto"]
         if self._image_path:
-            page.src.edit.setText(self._image_path)  # type: ignore[attr-defined]
-        self.win.show_page("recover")
-        if autostart and self._image_path:
-            page.start_scan()  # type: ignore[attr-defined]
+            page.prefill(self._image_path)  # type: ignore[attr-defined]
+        self.win.show_page("auto")
 
     def _dest_path(self) -> str:
         """The image file this page writes: the chosen folder plus a name derived from the disk (or the file path typed in)."""
@@ -565,6 +564,7 @@ class ImagePage(Page):
                 self.state_tag.set_tone("warn", tr("Stopped"))
                 self.status.setText(tr("Stopped. Press Create image again to resume from where it stopped."))
             elif r.complete:
+                self.partial_btn.setText(tr("Recover everything from the image"))
                 self.state_tag.set_tone("ok", tr("Complete"))
                 self.stepper.set_step(3)
                 self.progress.setValue(1000)

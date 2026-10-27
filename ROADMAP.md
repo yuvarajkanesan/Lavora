@@ -36,6 +36,15 @@ Legend: **done** = implemented and covered by automated tests on generated image
   your own key done natively (today: manage-bde/cryptsetup wrappers); RAID 6 parameter auto-detection beyond the md layout,
   non-standard levels (1E, 5E, 5EE, 6E)
 
+## Latest additions
+- done: **Recover everything** (one click / `autorecover`): volume discovery (partition table -> filesystem at start -> lost-volume scan), per-volume fallback
+  chain (primary metadata -> backup boot sector -> $MFT mirror -> combinations), carving fallback, de-duplication, HTML report of every method tried
+- done: partial images: unread-area map, incomplete files kept apart, "Recover everything from what's copied so far"
+- done: **only photos / documents / videos / audio** (`--only`, GUI selector); carving adds WAV, AVI, WebP; HEIC/MOV/3GP/M4A named by brand
+- done: **Check disk health** (page + `health` command): read-only speed / slow / unreadable test with verdict, plus SMART when available
+- done: imaging hardening for failing USB disks: no zero-fill preallocation, free-space check, dead-zone skipping, slow-area deferral, bus-reset retries
+- todo: ext/XFS journal-based undelete, RAID auto-detection beyond md layouts, native BitLocker unlock
+
 ## Phase 3
 - stub: Rescue ISO (recipe in `rescue/`, **not built or booted**); USB writer implemented and safety-tested, never run on real hardware
 - partial: Linux GRUB/chroot/initramfs/packages/fsck/kernel-rollback = **command plans**, fstab validator (tested); execution path exists but only with typed confirmation, on Linux

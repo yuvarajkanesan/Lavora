@@ -30,7 +30,9 @@ from ..core import boot, license
 from ..core.device import open_source
 from ..i18n import tr
 from . import icons, theme
+from .auto_page import AutoRecoverPage
 from .base import Page, SourceRow, Worker  # noqa: F401 - Worker re-exported for callers
+from .health_page import HealthPage
 from .home import HomePage
 from .pages import BackupPage, DoctorPage, ImagePage, PasswordPage, RaidPage
 from .recover_page import RecoverPage
@@ -165,8 +167,9 @@ class MainWindow(QMainWindow):
         col.addWidget(self.stack, 1)
         self.setCentralWidget(root)
         self.pages: dict[str, QWidget] = {"home": HomePage(self)}
-        for key, cls in (("recover", RecoverPage), ("doctor", DoctorPage), ("image", ImagePage), ("backup", BackupPage),
-                         ("boot", BootPage), ("password", PasswordPage), ("editor", EditorPage), ("raid", RaidPage)):
+        for key, cls in (("auto", AutoRecoverPage), ("recover", RecoverPage), ("doctor", DoctorPage), ("image", ImagePage), ("backup", BackupPage),
+                         ("boot", BootPage), ("password", PasswordPage), ("editor", EditorPage), ("raid", RaidPage),
+                         ("health", HealthPage)):
             self.pages[key] = cls(self)
         for page in self.pages.values():
             self.stack.addWidget(page)
@@ -200,6 +203,9 @@ class MainWindow(QMainWindow):
 
 
 def detect_theme(app: QApplication) -> str:
+    forced = os.environ.get("LAVORA_THEME", "").lower()  # LAVORA_THEME=light|dark overrides the system setting
+    if forced in ("light", "dark"):
+        return forced
     try:
         return "dark" if app.styleHints().colorScheme() == Qt.ColorScheme.Dark else "light"
     except AttributeError:

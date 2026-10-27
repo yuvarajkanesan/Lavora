@@ -312,6 +312,7 @@ class ExfatBuilder:
         b[108], b[109], b[110], b[111] = 9, 3, 1, 0x80
         b[510:512] = b"\x55\xaa"
         self.img[0:SECTOR] = b
+        self.img[12 * SECTOR:13 * SECTOR] = b  # exFAT keeps a backup boot region at sectors 12-23
         raw = b"".join(struct.pack("<I", v) for v in self.fat)
         self.img[self.fat_off * SECTOR:self.fat_off * SECTOR + len(raw)] = raw
         self.img[self._coff(2):self._coff(2) + len(self.bitmap)] = self.bitmap
@@ -550,6 +551,8 @@ class NtfsBuilder:
         boot[510:512] = b"\x55\xaa"
         self.img[0:SECTOR] = boot
         self.img[(self.total - 1) * SECTOR:] = boot  # backup boot sector in the last sector
+        mirror = 2 * self.cs  # $MFTMirr: copy of the first four MFT records
+        self.img[mirror:mirror + 4 * self.REC] = self.img[self.mft_lcn * self.cs:self.mft_lcn * self.cs + 4 * self.REC]
         return bytes(self.img)
 
 

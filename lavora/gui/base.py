@@ -178,11 +178,13 @@ class Page(QWidget):
             self._busy(False)
             on_done(result)
             t.quit()
+            t.wait(3000)  # let the worker thread finish before anything can destroy it
 
         def finished_bad(msg: str) -> None:
             self._busy(False)
             self.on_error(msg)
             t.quit()
+            t.wait(3000)
 
         def cleanup() -> None:
             if t in self._threads:

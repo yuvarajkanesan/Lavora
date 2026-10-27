@@ -98,6 +98,15 @@ def _size_mp4(src: BlockSource, off: int) -> int | None:
     return pos - off if ok_boxes >= 2 else None
 
 
+def _size_riff(src: BlockSource, off: int) -> int | None:
+    """RIFF container (WAV / AVI / WebP): total size is the 32-bit length at +4 plus the 8-byte header."""
+    h = src.read_at(off, 12)
+    if len(h) < 12:
+        return None
+    size = struct.unpack_from("<I", h, 4)[0] + 8
+    return size if 44 <= size <= 4 * 1024 ** 3 else None
+
+
 def _size_png(src: BlockSource, off: int) -> int | None:
     pos = off + 8
     for _ in range(100000):
@@ -125,6 +134,9 @@ SIGNATURES: list[Signature] = [
     Signature("MP3 (ID3)", "mp3", b"ID3", None, 32 * 1024 * 1024),
     Signature("RAR", "rar", b"Rar!\x1a\x07", None, 512 * 1024 * 1024),
     Signature("7-Zip", "7z", b"7z\xbc\xaf\x27\x1c", None, 512 * 1024 * 1024),
+    Signature("WAV audio", "wav", b"RIFF", None, 4 * 1024 ** 3, sizer=_size_riff),
+    Signature("AVI video", "avi", b"RIFF", None, 4 * 1024 ** 3, sizer=_size_riff),
+    Signature("WebP image", "webp", b"RIFF", None, 256 * 1024 * 1024, sizer=_size_riff),
 ]
 _SIZERS = {"mp4": _size_mp4}
 
@@ -146,6 +158,8 @@ def _validate_header(sig: Signature, data: bytes, i: int) -> bool:
         return i + 4 <= len(data) and data[i + 3] in (0xE0, 0xE1, 0xE2, 0xE8, 0xDB, 0xEE, 0xC0, 0xC4)
     if sig.ext == "gif":
         return data[i:i + 6] in (b"GIF87a", b"GIF89a")
+    if sig.ext in ("wav", "avi", "webp"):  # all three start with RIFF; the form type tells them apart
+        return data[i + 8:i + 12] == {"wav": b"WAVE", "avi": b"AVI ", "webp": b"WEBP"}[sig.ext]
     if sig.ext == "mp3":
         return i + 10 <= len(data) and data[i + 3] in (2, 3, 4) and data[i + 5] & 0x0F == 0
     return True
@@ -211,11 +225,25 @@ def _determine_size(source: BlockSource, off: int, sig: Signature) -> int | None
     return min(sig.max_size, source.size - off) if sig.ext in ("mp3", "rar", "7z") else None
 
 
+def brand_ext(blob: bytes) -> str:
+    """File extension for an ISO-BMFF file from its 'ftyp' major brand (MP4 / MOV / HEIC / 3GP / M4A)."""
+    brand = blob[8:12]
+    if brand in (b"heic", b"heix", b"mif1", b"msf1", b"hevc"):
+        return "heic"
+    if brand == b"qt  ":
+        return "mov"
+    if brand[:3] == b"3gp":
+        return "3gp"
+    if brand in (b"M4A ", b"M4B "):
+        return "m4a"
+    return "mp4"
+
+
 def extract(source: BlockSource, cf: CarvedFile, out_dir: str) -> str:
     """Write one carved file into `out_dir` (the caller has already vetted the folder) and return its path."""
     os.makedirs(out_dir, exist_ok=True)
     head = source.read_at(cf.offset, 8192)
-    ext = office_kind(head) if cf.sig.ext == "zip" else cf.sig.ext
+    ext = office_kind(head) if cf.sig.ext == "zip" else brand_ext(head) if cf.sig.ext == "mp4" else cf.sig.ext
     path = os.path.join(out_dir, f"{ext}_{cf.offset:012x}.{ext}")
     h = hashlib.sha256()
     with open(path, "wb") as f:

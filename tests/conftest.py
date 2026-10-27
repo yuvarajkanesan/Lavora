@@ -33,3 +33,18 @@ def write_img(tmp_path):
         p.write_bytes(data)
         return str(p)
     return _write
+
+
+@pytest.fixture(autouse=True)
+def _close_gui_windows():
+    """Close every window a test created, so worker threads are stopped and joined before Qt objects are torn down."""
+    yield
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        return
+    app = QApplication.instance()
+    if app is not None:
+        for w in app.topLevelWidgets():
+            w.close()
+        app.processEvents()

@@ -275,6 +275,34 @@ def cmd_clone(a: argparse.Namespace) -> int:
         return 0 if ok and res.complete else 2
 
 
+def cmd_autorecover(a: argparse.Namespace) -> int:
+    from ..core import autorecover
+    lic = license.current()
+    unread = unread_mod.load_unread(a.source) if os.path.isfile(a.source) else None
+    last = {"stage": ""}
+
+    def on_step(step) -> None:
+        mark = {"ok": "ok  ", "failed": "FAIL", "skipped": "skip", "info": "..  "}.get(step.status, "    ")
+        print(f"[{mark}] {step.stage}" + (f": {step.detail}" if step.detail else ""))
+
+    def prog(stage: str, done: int, total: int) -> None:
+        if stage != last["stage"]:
+            last["stage"] = stage
+        if sys.stderr.isatty():
+            tail = f" {100 * done // total}%" if total else f" {done:,} files"
+            print(f"\r{stage}{tail}", end="", file=sys.stderr, flush=True)
+
+    with open_source(a.source) as src:
+        if unread:
+            print(f"note: this image is incomplete ({_fmt_size(unread_mod.unread_total(unread))} never copied); affected files are kept apart")
+        rep = autorecover.auto_recover(src, a.out, include_live=not a.deleted_only, thorough=a.thorough, license=lic, unread=unread,
+                                       progress=prog, cancel=TOKEN, on_step=on_step, only_exts=autorecover.parse_only(a.only))
+    print("\n" + autorecover.summary_text(rep))
+    if rep.report_path:
+        print(f"report: {rep.report_path}")
+    return 130 if rep.cancelled else 0 if rep.recovered else 1
+
+
 def _parse_int(v: str) -> int:
     return int(v, 0)
 
@@ -344,6 +372,16 @@ def cmd_smart(a: argparse.Namespace) -> int:
     _out(a, r.__dict__, f"{r.model or a.device}: {r.status} (score {r.score}/100)" + "".join(f"\n  ! {w}" for w in r.warnings) +
          (f"\n  {r.detail}" if r.detail else ""))
     return 0 if r.status in ("good", "unknown") else 1
+
+
+def cmd_health(a: argparse.Namespace) -> int:
+    from ..core import health
+    limit = None if a.full else int(a.gb * 1e9)
+    is_disk = a.source.lower().startswith(("\\\\.\\physicaldrive", "/dev/"))
+    with open_source(a.source) as src:
+        rep = health.check_health(src, max_bytes=limit, smart_device=a.source if is_disk else None, progress=_progress("testing"), cancel=TOKEN)
+    print("\n" + rep.summary_text())
+    return 130 if rep.cancelled else {"healthy": 0, "slow": 1, "failing": 2}[rep.verdict]
 
 
 def cmd_surface(a: argparse.Namespace) -> int:
@@ -618,6 +656,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target")
     p.add_argument("--confirm", help='for a physical target: "ERASE <target>"')
     p.add_argument("--verify", action="store_true")
+    p = add("autorecover", cmd_autorecover, "recover EVERYTHING from a disk/image automatically (tries every method, falls back to carving)")
+    p.add_argument("source")
+    p.add_argument("--out", required=True, help="a folder on a DIFFERENT drive")
+    p.add_argument("--deleted-only", action="store_true", help="skip files that still exist normally")
+    p.add_argument("--thorough", action="store_true", help="also scan the whole source for lost volumes and files by content (slower)")
+    p.add_argument("--only", help="recover only these: photos, documents, videos, audio and/or extensions, e.g. photos,pdf")
     p = add("hex", cmd_hex, "hex view of a sector range (any source, read-only)")
     p.add_argument("source")
     p.add_argument("--offset", type=_parse_int, default=0)
@@ -644,6 +688,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("smart", cmd_smart, "SMART health")
     p.add_argument("device")
     p.add_argument("--json", action="store_true")
+    p = add("health", cmd_health, "disk health check: read-only speed/slow/unreadable test + SMART (exit 0 healthy, 1 slow, 2 failing)")
+    p.add_argument("source")
+    p.add_argument("--gb", type=float, default=1.0, help="how much to test (default 1 GB)")
+    p.add_argument("--full", action="store_true", help="test the whole disk")
     p = add("surface", cmd_surface, "read-only surface scan")
     p.add_argument("source")
     p.add_argument("--max-bytes", type=int)

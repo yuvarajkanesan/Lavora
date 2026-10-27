@@ -10,13 +10,15 @@ from .base import Page
 from .widgets import ActionCard, FeatureChip
 
 SECTIONS = [
-    ("RECOVER DATA", [("recover", "I deleted files", "Scan, preview and recover", True),
+    ("RECOVER DATA", [("auto", "Recover everything", "One click: finds the volumes and recovers all files", True),
+                      ("recover", "I deleted files", "Scan, preview and pick files yourself", False),
                       ("image", "Disk is failing", "Image it first, recover from the image", False),
                       ("raid", "RAID builder", "Rebuild an array from its disks", False)]),
     ("REPAIR A SYSTEM", [("boot", "PC won't boot", "Diagnose and repair boot problems", False),
                          ("plans", "Boot repair plans", "Windows and Linux commands", False),
                          ("password", "Forgot password", "Owner-only account access", False)]),
     ("PROTECT", [("backup", "Back up my PC", "Incremental, encrypted, verified", False),
+                 ("health", "Check disk health", "Read-only speed and error test", False),
                  ("editor", "Disk editor", "Hex view, search, decode", False)]),
 ]
 TARGET = {"boot": "doctor", "plans": "boot"}  # card id -> page key

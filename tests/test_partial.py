@@ -168,28 +168,17 @@ def test_partial_recover_button_without_an_image_explains_what_to_do(monkeypatch
     assert shown and "no image yet" in shown[0].lower()
 
 
-def test_partial_recover_button_opens_the_recover_page_and_scans_the_copied_part(monkeypatch, tmp_path, partial_disk):
+def test_partial_recover_button_opens_recover_everything_with_the_image_loaded(monkeypatch, tmp_path, partial_disk):
     win = _app(monkeypatch)
     path, _first, _second = partial_disk
-    import os
     page = win.pages["image"]
-    folder = os.path.dirname(path)
     page._image_path = path
-    page.src.edit.setText(path)  # derives to <folder>/lavora-partial.img only for devices; use the explicit file path instead
+    page.src.edit.setText(path)
     page.dest.setText(path)  # a path ending in .img is used as-is
     page.partial_recover()
-    rec = win.pages["recover"]
-    assert win.stack.currentWidget() is rec and rec.src.path == path
-    for _ in range(50):
-        pump(100)
-        if rec.entries:
-            break
-    assert any(e.name == "first.bin" for e in rec.entries)
-    assert rec.unread  # the page knows this image is incomplete
-    second = next(e for e in rec.entries if e.name == "second.bin")
-    rec._annotate([second])
-    assert second.extra.get("unread_pct", 0) > 0
-    assert folder  # (kept for clarity)
+    auto = win.pages["auto"]
+    assert win.stack.currentWidget() is auto and auto.src.path == path
+    assert not auto.dest.text()  # it still needs a destination folder: it never starts by itself
 
 
 def test_partial_recover_button_stops_a_running_imaging_job_first(monkeypatch, tmp_path, partial_disk):

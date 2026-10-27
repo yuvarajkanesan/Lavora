@@ -2,6 +2,9 @@
 
 ## 0.2.0 - unreleased
 ### Added
+- **Recover everything** (GUI page, `lavora-cli autorecover`): finds volumes (partition table -> filesystem at start -> lost-volume scan), opens each with fallbacks
+  (backup boot sector, MFT mirror, backup superblock), recovers all files, falls back to signature carving, writes an HTML report of every method tried.
+- Partial-image awareness: files touching never-copied areas are flagged and recovered separately; "Recover what's copied so far" button.
 - Handles multi-terabyte disks without hanging: streaming scans, cancel everywhere, resume points, bounded memory (see ROADMAP).
 - Virtual RAID 0/1/5/6/10 with degraded reads and parameter auto-detection; `raid-detect`; GUI RAID builder.
 - Virtual disk containers: dynamic VHD, VHDX, VMDK, VDI.
